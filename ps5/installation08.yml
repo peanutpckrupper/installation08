@@ -1,0 +1,47 @@
+# Installation 08 for Prospero Win, in Lutris's installer format, for
+# prospero-win's tools/pw_install.py.
+#
+# Installation 08 runs the games of Halo: The Master Chief Collection offline,
+# without MCC's own launcher. This recipe makes its Wine prefix: Wine, DXVK
+# for Direct3D 11, and installation08.exe in C:\Games\Installation08, where it
+# keeps its settings, saves and log.
+#
+# The MCC files do not go in the prefix. Upload them to the console yourself,
+# once, into /data/prospero-win/mcc (halo1, halo2, halo3, halo3odst,
+# haloreach, halo4 and mcc/binaries/win64); Installation 08 reads them there
+# through Wine's Z: drive. That keeps the prefix small and lets you add games
+# later without reinstalling.
+#
+# After installing, set the profile's graphics to opengl, the mode Installation
+# 08 was tested with (DXVK still does Direct3D): pw_install.py only sets up
+# opengl with --mesa-zink, and on the console prospero-win copies its own Mesa
+# files into the prefix when the game starts:
+#   sed -i 's/^graphics = dxvk$/graphics = opengl/' LIBRARY/profiles/installation08.profile
+#
+# Installation 08 1.1 or later: it puts MCC's own XAudio 2.9 in the prefix
+# the first time it runs, which the games need.
+name: "Installation 08 (Halo: The Master Chief Collection)"
+game_slug: installation08
+version: Installation 08 1.1 (Prospero Win)
+slug: installation08-prospero-win
+runner: wine
+prospero:
+  name: Installation 08
+  graphics: dxvk
+  display: {desktop: 1920x1080, scaling: fit}
+  input: {mode: xinput}
+script:
+  game:
+    exe: drive_c/Games/Installation08/installation08.exe
+    args: --mcc Z:\data\prospero-win\mcc
+    prefix: $GAMEDIR
+  files:
+  - exe: "N/A:Select installation08.exe (Installation 08 1.1 or later)"
+  wine:
+    dxvk: true
+    dxvk_version: "2.6.2"
+    overrides:
+      xaudio2_9: n
+  installer:
+  - task: {name: create_prefix, prefix: $GAMEDIR}
+  - copy: {src: exe, dst: $GAMEDIR/drive_c/Games/Installation08}

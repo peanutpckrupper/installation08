@@ -1,0 +1,30 @@
+MAKING THE PS5 PACKAGE (for whoever publishes a release, not for players)
+
+Players get Installation08-PS5.zip: a ready Wine prefix with installation08.exe, its
+prospero-win profile, and README-PS5.txt. It is made once per release on a PC that
+has prospero-win's source and its PC Wine (tools/build_host_wine.sh), in WSL.
+It holds Wine's own files (LGPL), DXVK (zlib licence), prospero-win's wowprospero.dll
+(LGPL) and installation08.exe. No MCC files and nothing from Windows.
+
+From prospero-win's source folder:
+
+1. Make the prefix with the recipe:
+     python3 tools/pw_install.py /path/to/installation08.yml \
+         --library ~/i08-library --wine <PC Wine>/bin/wine \
+         --file exe=/path/to/installation08.exe
+   (--library must be a new folder or one without an installation08 prefix yet.)
+
+2. Turn it into the package (wowprospero.dll comes from a prospero-win app folder,
+   win/wine/lib/wine/x86_64-windows/):
+     python3 /path/to/make_ps5_package.py --prospero . --library ~/i08-library \
+         --cpu-dll /path/to/wowprospero.dll --readme /path/to/README-PS5.txt \
+         --out ~/Installation08-PS5
+   This writes ~/Installation08-PS5/ and ~/Installation08-PS5.zip, laid out as
+   /data/prospero-win on the console (as tools/pw_prefix.py push would leave it), with
+   the profile set to graphics = opengl, the mode Installation 08 was tested with.
+
+3. Test it the way a player would: follow README-PS5.txt on a console.
+
+A new release of installation08.exe alone doesn't need a new package: players
+replace the exe (README-PS5.txt, "Updating"). Make a new package when the prefix
+or profile changes.

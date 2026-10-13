@@ -1,0 +1,24 @@
+#include <winver.h>
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "Installation 08 - offline campaign launcher"
+      VALUE "ProductName", "Installation 08"
+      VALUE "FileVersion", "1.1.0"
+      VALUE "ProductVersion", "1.1.0"
+      VALUE "OriginalFilename", "installation08.exe"
+      VALUE "InternalName", "Installation 08"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
