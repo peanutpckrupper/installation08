@@ -4,7 +4,8 @@ Players get Installation08-PS5.zip: a ready Wine prefix with installation08.exe,
 prospero-win profile, and README-PS5.txt. It is made once per release on a PC that
 has prospero-win's source and its PC Wine (tools/build_host_wine.sh), in WSL.
 It holds Wine's own files (LGPL), DXVK (zlib licence), prospero-win's wowprospero.dll
-(LGPL) and installation08.exe. No MCC files and nothing from Windows.
+(LGPL) and installation08.exe. No MCC files and nothing from Windows: players copy
+ucrtbase.dll from their own PC (README-PS5.txt, step 2.4), which the profile needs.
 
 From prospero-win's source folder:
 
@@ -28,3 +29,11 @@ From prospero-win's source folder:
 A new release of installation08.exe alone doesn't need a new package: players
 replace the exe (README-PS5.txt, "Updating"). Make a new package when the prefix
 or profile changes.
+
+When only installation08.exe, README-PS5.txt or a profile line changes, the last
+package can be updated instead of made again:
+  - replace prospero-win/prefixes/installation08/drive_c/Games/Installation08/installation08.exe
+  - replace README.txt with the new README-PS5.txt
+  - edit prospero-win/profiles/installation08.profile if its line changed (1.2:
+    dll_overrides = d3d8,d3d9,d3d10core,d3d11,dxgi,xaudio2_9,ucrtbase=n)
+  - zip the Installation08-PS5 folder again (the zip holds the folder itself).

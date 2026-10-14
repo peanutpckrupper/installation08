@@ -1,9 +1,8 @@
-// mcchost: a minimal stand-in for MCC's game host, to run one Halo game DLL from
-// The Master Chief Collection on its own (offline, single player).
+// Installation 08: a stand-in for MCC's game host, to run the Halo game DLLs from
+// The Master Chief Collection on their own (offline, and LAN).
 //
-// Stage 1 (this file) is a probe. It loads <game>\<game>.dll, starts the engine on
-// a window and Direct3D 11 device of its own, and logs every call the game makes
-// back into the host, so we can see which host functions each game needs.
+// It loads <game>\<game>.dll, starts the engine on a window and Direct3D 11 device of
+// its own, and answers the calls the game makes back into the host.
 //
 // The host interface (the game engine's methods, the 121 host callbacks, the game
 // options layout) follows the community's research published in libmcc
@@ -15,6 +14,8 @@
 // The log is installation08.log next to installation08.exe.
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <d3d11.h>
@@ -23,6 +24,7 @@
 #include <d2d1.h>
 #include <d2d1helper.h>
 #include <dwrite.h>
+#include <wincodec.h>
 #include <atomic>
 #include <mutex>
 #include <set>
@@ -30,6 +32,7 @@
 #include <algorithm>
 #include <map>
 #include <deque>
+#include <thread>
 #include <vector>
 #include <cstdarg>
 #include <cstddef>
@@ -95,6 +98,7 @@ static void logf(const char *fmt, ...)
 // Detailed logging (every host call, call chains) only with verbose_log = 1 in the
 // .ini or --verbose 1; otherwise the log keeps the milestones and problems.
 static bool g_verbose_log;
+static bool g_loading_screen = true; // loading_screen = 0 in installation08.ini turns it off
 static bool should_log(std::atomic<uint32_t> &counter)
 {
     if (!g_verbose_log) return false;
@@ -240,6 +244,17 @@ struct i_saved_game_file
     virtual wchar_t *get_author(void *) const = 0;
     virtual wchar_t *set_author(const void *) = 0;
     virtual void copy_to_game_options(struct s_game_options *) const = 0;
+    // The file's bytes, as MCC writes them (Reach: a 29481-byte .mvar). The buffer is the object's own.
+    virtual bool save_to_file(const char **buf, uint32_t *len) = 0;
+    virtual bool save_to_file_(const char **buf, uint32_t *len) = 0;
+};
+// A map variant (Forge map) adds these (libmcc i_scenario_map_variant).
+struct i_scenario_map_variant : i_saved_game_file
+{
+    virtual bool is_built_in() = 0;
+    virtual bool is_built_in_2() = 0;
+    virtual void unknown_12() = 0;
+    virtual const int32_t *get_map_id() = 0; // s_scenario_map_id: the map's id first
 };
 struct i_data_access
 {
@@ -336,8 +351,95 @@ static stub_object g_host = {g_host_vtable};
 // ---------------------------------------------------------------- host methods
 static void h_begin_frame(void *) { LOG_CALL(0, "host.begin_frame"); }
 
+static HWND g_hwnd;
+
+// F12 in a game: the frame as a PNG in screenshots\ next to the exe (written on its own
+// thread so the game doesn't stall).
+static void save_png(std::wstring path, std::vector<uint8_t> bgr, UINT w, UINT h)
+{
+    bool ok = false;
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory *factory = nullptr;
+    IWICStream *stream = nullptr;
+    IWICBitmapEncoder *encoder = nullptr;
+    IWICBitmapFrameEncode *frame = nullptr;
+    IPropertyBag2 *props = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory, (void **)&factory)) &&
+        SUCCEEDED(factory->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+        SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) && SUCCEEDED(encoder->CreateNewFrame(&frame, &props)) &&
+        SUCCEEDED(frame->Initialize(props)) && SUCCEEDED(frame->SetSize(w, h)))
+    {
+        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        ok = SUCCEEDED(frame->SetPixelFormat(&format)) && IsEqualGUID(format, GUID_WICPixelFormat24bppBGR) &&
+             SUCCEEDED(frame->WritePixels(h, w * 3, (UINT)bgr.size(), bgr.data())) && SUCCEEDED(frame->Commit()) &&
+             SUCCEEDED(encoder->Commit());
+    }
+    if (props) props->Release();
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    if (factory) factory->Release();
+    if (SUCCEEDED(co)) CoUninitialize();
+    logf("screenshot %s: %s", ok ? "saved" : "NOT saved", narrow(path.c_str()).c_str());
+}
+
+static void capture_frame(IDXGISwapChain *swapchain)
+{
+    ID3D11Texture2D *back = nullptr;
+    if (!swapchain || FAILED(swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back))) return;
+    D3D11_TEXTURE2D_DESC d;
+    back->GetDesc(&d);
+    bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    bool rgba = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    ID3D11Device *device = nullptr;
+    ID3D11DeviceContext *context = nullptr;
+    ID3D11Texture2D *staging = nullptr;
+    back->GetDevice(&device);
+    if (device) device->GetImmediateContext(&context);
+    if ((bgra || rgba) && d.SampleDesc.Count == 1 && context)
+    {
+        D3D11_TEXTURE2D_DESC sd = d;
+        sd.Usage = D3D11_USAGE_STAGING, sd.BindFlags = 0, sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ, sd.MiscFlags = 0;
+        sd.MipLevels = 1, sd.ArraySize = 1;
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(device->CreateTexture2D(&sd, nullptr, &staging)))
+        {
+            context->CopyResource(staging, back);
+            if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
+            {
+                std::vector<uint8_t> bgr((size_t)d.Width * d.Height * 3);
+                for (UINT y = 0; y < d.Height; y++)
+                {
+                    const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+                    uint8_t *dst = bgr.data() + (size_t)y * d.Width * 3;
+                    for (UINT x = 0; x < d.Width; x++, src += 4, dst += 3)
+                        dst[0] = src[rgba ? 2 : 0], dst[1] = src[1], dst[2] = src[rgba ? 0 : 2];
+                }
+                context->Unmap(staging, 0);
+                CreateDirectoryW((g_cfg.host_dir + L"\\screenshots").c_str(), nullptr);
+                SYSTEMTIME t;
+                GetLocalTime(&t);
+                wchar_t name[96];
+                swprintf(name, 96, L"%ls %04d-%02d-%02d %02d-%02d-%02d-%03d.png", g_cfg.game.c_str(), t.wYear, t.wMonth, t.wDay,
+                         t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+                std::thread(save_png, g_cfg.host_dir + L"\\screenshots\\" + name, std::move(bgr), d.Width, d.Height).detach();
+            }
+        }
+    }
+    else logf("screenshot: picture format %d not supported", (int)d.Format);
+    if (staging) staging->Release();
+    if (context) context->Release();
+    if (device) device->Release();
+    back->Release();
+}
+
 static void h_end_frame(void *, IDXGISwapChain *swapchain, UINT *flags)
 {
+    static bool f12_was_down;
+    bool f12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0 && GetForegroundWindow() == g_hwnd;
+    if (f12 && !f12_was_down) capture_frame(swapchain ? swapchain : g_swapchain);
+    f12_was_down = f12;
     LOG_CALL(1, "host.end_frame swapchain=%p (ours %p) flags=%u", (void *)swapchain, (void *)g_swapchain,
              flags ? *flags : 0u);
     // The game presents the frame itself right after this call, with the flags the
@@ -356,21 +458,968 @@ static void h_set_game_state(void *, int state)
     menu::loading_state(state);
 }
 
-// Network: one machine, one player. Halo CE's multiplayer runs a server and a client
-// that talk through these even when both are this machine, so a packet sent to our
-// own address is handed back on the next receive (a loopback).
+// Network. Halo CE's multiplayer runs a server and a client that talk through these
+// even when both are this machine, so a packet sent to our own address is handed back
+// on the next receive (a loopback). With LAN play (lan:: below) packets for another
+// machine's address go to it over UDP.
 struct net_packet { std::vector<char> data; uint64_t from; uint32_t port; };
 static std::mutex g_net_lock;
 static std::deque<net_packet> g_net_queue;
+static void net_deliver(const char *buf, uint32_t len, uint64_t from, uint32_t port)
+{
+    std::lock_guard<std::mutex> l(g_net_lock);
+    if (g_net_queue.size() > 4096) g_net_queue.pop_front();
+    g_net_queue.push_back({std::vector<char>(buf, buf + len), from, port});
+}
+
+// ---------------------------------------------------------------- LAN play
+// One machine hosts a game (Custom game > LAN), others find it on the network (LAN
+// games on the main menu) or join it by IP address. Every machine has an address (a
+// 64-bit number the games use to name machines); the host's player list gives each
+// machine's address and its player's XUID, and the games send their packets to those
+// addresses. Here an address is mapped to the machine's IP and port, and packets
+// travel in UDP datagrams on port 27080:
+//   header (magic, version, type, sender's address), then the message.
+// Custom games, Forge and Firefight, in every game.
+namespace lan
+{
+enum role_t { k_off, k_host, k_client };
+static std::atomic<int> g_role{k_off};
+static uint16_t g_port = 27080;
+static SOCKET g_sock = INVALID_SOCKET;
+static bool g_opened;
+static bool g_port_taken; // another program has port 27080: joining works, hosting can't be found
+static uint64_t g_my_id;
+static std::string g_name;
+static std::string g_problem; // shown in the launcher when LAN play could not start
+static int64_t ms() { return (int64_t)GetTickCount64(); }
+
+enum : uint16_t { t_game = 1, t_hello, t_welcome, t_start, t_end, t_find, t_here, t_lobby, t_bye, t_map,
+                  t_save, t_save_query, t_save_status, t_frag, t_save_offer };
+#pragma pack(push, 1)
+struct header { uint32_t magic; uint16_t version, type; uint64_t from; };
+struct seat { uint64_t xuid, address; };
+// What a host's game is: sent to machines looking for games, and to those that joined.
+struct lobby_msg
+{
+    char host[32];
+    char game[16];     // the game's folder ("halo1")
+    char map[48];      // names, for showing (UTF-8)
+    char variant[64];
+    uint8_t playing;   // the host is in a game now
+    uint8_t count;     // players, host first
+    char names[16][32];
+    // The lobby (version 7): what the host has chosen, and whether each player can play it.
+    uint8_t mode;       // 1 campaign, 2 Spartan Ops, 3 custom game or Forge, 5 Firefight
+    uint8_t difficulty;
+    char map_file[48];  // the map's file (no .map), to check it's installed
+    uint32_t key;       // changes with game and map file: a player's answer is for this key
+    uint8_t status[16]; // per player: 0 checking, 1 ready, 2 doesn't have the game, 3 doesn't have the map
+    char detail[64];    // a line about the choice ("Heroic", "Continue: Requiem")
+};
+// A joining machine's hello: its name, and whether it can play the lobby's choice.
+struct hello_msg
+{
+    char name[32];
+    uint32_t key;
+    uint8_t status;
+};
+struct start_msg
+{
+    char game[32];
+    int32_t map;
+    char file[64];
+    int32_t mode;
+    int32_t difficulty;
+    char variant[260];
+    uint32_t count;
+    seat seats[16];
+    uint32_t game_id;      // the same for the copies of one start message
+    uint32_t map_size;     // a saved Forge map: sent first, as a t_map message with this game_id
+    char map_name[64];     // its name (UTF-8)
+    int32_t classic;       // campaign: the host's classic graphics choice (Halo CE, Halo 2)
+    uint32_t save_size;    // co-op continue: the host's saved game, sent first in t_save pieces
+    uint64_t save_hash;    //   (and its FNV-1a hash, to check the copy)
+    uint32_t variant_size; // the game type's file, so every machine plays the same one
+    char variant_data[61440]; // the biggest game types (Halo 4, Reach) are about 33 KB
+};
+// A saved Forge map for the next game (Reach's are 29 KB; MCC's limit is 58 KB).
+struct map_msg
+{
+    uint32_t game_id;
+    uint32_t size;
+    char data[61440];
+};
+// Co-op continue: the host's saved game (4 to 11 MB) in pieces, sent before the start.
+struct save_piece
+{
+    uint32_t game_id;
+    uint32_t total;  // the whole save's size
+    uint32_t index;  // which piece
+    uint32_t pieces; // how many
+};
+static const uint32_t k_piece = 32000;
+static const uint32_t k_most_pieces = 2048; // 64 MB
+// Sent before any piece: the save's size and each piece's hash. A client fills in the
+// pieces its own co-op save already has (usually all or most of them: every machine
+// saved the same checkpoint), so only the others need to cross the network.
+struct save_offer
+{
+    uint32_t game_id;
+    uint32_t total;
+    uint32_t pieces;
+    char game[16];
+    uint64_t hash[k_most_pieces];
+};
+// A client's answer to t_save_query: which pieces it has.
+struct save_status
+{
+    uint32_t game_id;
+    uint8_t have[k_most_pieces / 8];
+};
+#pragma pack(pop)
+static const uint32_t k_magic = 0x4C383049; // "I08L"
+static const uint16_t k_version = 10;
+static const size_t k_start_head = offsetof(start_msg, variant_data);
+
+static std::mutex g_lock; // guards the lists below
+struct peer { uint64_t id; sockaddr_in addr; std::string name; int64_t heard; uint32_t key = 0; uint8_t status = 0; };
+// Client: can this machine play what the lobby says (status codes as in lobby_msg)?
+static int (*g_check_lobby)(const char *game, const char *map_file);
+// Client: this machine's own co-op save for a game ("" if none).
+static std::string (*g_read_coop_save)(const char *game);
+// Host: players the next start leaves out (they can't play it).
+static std::vector<uint64_t> g_left_out;
+static std::vector<peer> g_peers; // host: the machines that joined; client: the host
+static lobby_msg g_lobby_out;     // host: what it's offering
+static lobby_msg g_lobby_in;      // client: the host's game
+struct found_game { uint64_t id; sockaddr_in addr; lobby_msg info; int64_t seen; };
+static std::vector<found_game> g_found;
+static sockaddr_in g_join_addr;   // client: where the host is
+static std::string g_join_text;
+static std::string g_left_reason; // client: why it's no longer in a game's lobby
+static std::atomic<bool> g_welcomed;
+static std::atomic<int64_t> g_host_heard, g_searching_until;
+
+static std::vector<seat> g_seats; // a networked game's players, host first; empty otherwise
+static uint64_t g_my_xuid = 0x0009000000000001ull;
+static std::atomic<uint64_t> g_sent, g_received, g_dropped;
+// Game packets carry a number, one count per sender: a gap means packets were lost on
+// the way (the network, or a full receive buffer), which nothing else would show.
+static std::atomic<uint32_t> g_game_seq;
+static std::atomic<uint64_t> g_lost, g_late;
+static uint32_t g_last_seq_from[16];
+static uint64_t g_seq_peer[16];
+static std::atomic<int> g_logged;
+static std::mutex g_start_lock;
+static start_msg g_start;
+static std::atomic<bool> g_start_ready, g_end_ready;
+static uint32_t g_last_game_id; // receive thread only
+static map_msg g_map_in;        // the host's Forge map for a game (under g_start_lock)
+static int64_t g_start_waiting; // main thread: since when a start waits for its map
+// Co-op continue. The saved game the next co-op game starts from, on every machine
+// (host: read from its file; client: received from the host). Empty: start the mission.
+static std::vector<char> g_resume_data;
+// Client, under g_start_lock: the save arriving from the host.
+static uint32_t g_save_in_id;
+static std::vector<char> g_save_in;
+// Client: its own co-op save of the same checkpoint, which it continues from instead of
+// the host's copy (each machine's save also holds things that are its own, such as which
+// machine it is). For the start with this game_id.
+static uint32_t g_save_own_id;
+static std::vector<char> g_save_own;
+static std::vector<uint8_t> g_save_in_have;
+// Host, under g_lock: what each client last said it has.
+struct save_report { uint64_t id; uint32_t game_id; std::vector<uint8_t> have; uint32_t answers; };
+static std::vector<save_report> g_save_reports;
+
+static uint64_t fnv64(const char *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ (uint8_t)p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static std::string ip_text(const sockaddr_in &a, bool port = true)
+{
+    char t[64];
+    inet_ntop(AF_INET, &a.sin_addr, t, sizeof(t));
+    return port ? std::string(t) + ":" + std::to_string(ntohs(a.sin_port)) : std::string(t);
+}
+static std::string field(const char *s, size_t n) { return std::string(s, strnlen(s, n)); }
+static void put(char *dst, size_t n, const std::string &s) { memset(dst, 0, n); memcpy(dst, s.data(), std::min(n - 1, s.size())); }
+
+// Big messages (a start with its game type, a Forge map, a piece of a saved game) go
+// in pieces of at most k_frag bytes: the PS5's network stack (FreeBSD's) refuses to
+// send a UDP datagram over 9216 bytes, and big datagrams get lost more on Wi-Fi.
+#pragma pack(push, 1)
+struct frag_head { uint32_t id, total, offset; uint16_t type, pad; };
+#pragma pack(pop)
+static const uint32_t k_frag = 8000;
+static void send_one(const sockaddr_in &to, uint16_t type, const void *body, size_t len)
+{
+    static thread_local std::vector<char> packet(sizeof(header) + k_frag + sizeof(frag_head) + 64);
+    if (sizeof(header) + len > packet.size()) packet.resize(sizeof(header) + len);
+    header h = {k_magic, k_version, type, g_my_id};
+    memcpy(packet.data(), &h, sizeof(h));
+    if (len) memcpy(packet.data() + sizeof(h), body, len);
+    for (int tries = 0;; tries++)
+    {
+        if (sendto(g_sock, packet.data(), (int)(sizeof(h) + len), 0, (const sockaddr *)&to, sizeof(to)) != SOCKET_ERROR) break;
+        int e = WSAGetLastError();
+        // The PS5 (FreeBSD) says "no buffer space" when sending faster than the network
+        // takes it, instead of waiting: wait a moment and send again.
+        if (e == WSAENOBUFS && tries < 200) { Sleep(1); continue; }
+        static std::atomic<int> logged;
+        if (logged++ < 5) logf("lan: sending %zu bytes failed (error %d)", sizeof(h) + len, e);
+        g_dropped++;
+        break;
+    }
+}
+static void raw_send(const sockaddr_in &to, uint16_t type, const void *body, size_t len)
+{
+    if (g_sock == INVALID_SOCKET) return;
+    if (len <= k_frag) { send_one(to, type, body, len); return; }
+    static std::atomic<uint32_t> next_id{1};
+    uint32_t id = next_id++;
+    std::vector<char> piece(sizeof(frag_head) + k_frag);
+    for (uint32_t at = 0; at < len; at += k_frag)
+    {
+        uint32_t n = std::min<uint32_t>(k_frag, (uint32_t)len - at);
+        frag_head fh = {id, (uint32_t)len, at, type, 0};
+        memcpy(piece.data(), &fh, sizeof(fh));
+        memcpy(piece.data() + sizeof(fh), (const char *)body + at, n);
+        send_one(to, t_frag, piece.data(), sizeof(fh) + n);
+    }
+}
+
+// Receiving end: put the pieces back together (receive thread only).
+struct frag_buf { uint64_t from; uint32_t id; uint16_t type; std::vector<char> data; std::vector<bool> got; uint32_t have; int64_t started; };
+static bool reassemble(uint64_t from, const char *body, int len, std::vector<char> &out, uint16_t &type)
+{
+    static std::vector<frag_buf> bufs;
+    if (len < (int)sizeof(frag_head)) return false;
+    frag_head fh;
+    memcpy(&fh, body, sizeof(fh));
+    uint32_t n = (uint32_t)len - sizeof(fh);
+    if (fh.total > (1u << 20) || fh.offset % k_frag || fh.offset >= fh.total || n != std::min(k_frag, fh.total - fh.offset)) return false;
+    int64_t now = (int64_t)GetTickCount64();
+    bufs.erase(std::remove_if(bufs.begin(), bufs.end(), [now](const frag_buf &b) { return now - b.started > 10000; }), bufs.end());
+    frag_buf *b = nullptr;
+    for (auto &x : bufs)
+        if (x.from == from && x.id == fh.id) b = &x;
+    if (!b)
+    {
+        if (bufs.size() >= 64) bufs.erase(bufs.begin());
+        bufs.push_back({from, fh.id, fh.type, std::vector<char>(fh.total), std::vector<bool>((fh.total + k_frag - 1) / k_frag), 0, now});
+        b = &bufs.back();
+    }
+    if (b->data.size() != fh.total) return false;
+    uint32_t index = fh.offset / k_frag;
+    if (!b->got[index])
+    {
+        b->got[index] = true;
+        b->have++;
+        memcpy(b->data.data() + fh.offset, body + sizeof(fh), n);
+    }
+    if (b->have < b->got.size()) return false;
+    out.swap(b->data);
+    type = b->type;
+    bufs.erase(bufs.begin() + (b - bufs.data()));
+    return true;
+}
+
+static bool find_peer(uint64_t id, sockaddr_in *addr)
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    for (const auto &p : g_peers)
+        if (p.id == id) { if (addr) *addr = p.addr; return true; }
+    return false;
+}
+
+static void log_packet(const char *dir, uint64_t id, uint32_t port, uint32_t len)
+{
+    if (!g_verbose_log) return;
+    int n = ++g_logged;
+    if (n <= 20) logf("lan: %s %u bytes, game port %u, address %llx", dir, len, port, (unsigned long long)id);
+    else if (n == 21) logf("lan: (further packets are counted, not logged)");
+}
+
+// A packet the game sends to another machine.
+static void send_game(uint64_t to, uint32_t port, const char *buf, uint32_t len)
+{
+    sockaddr_in addr;
+    if (!find_peer(to, &addr))
+    {
+        if (++g_dropped <= 10) logf("lan: no machine has address %llx; packet dropped", (unsigned long long)to);
+        return;
+    }
+    char body[1508];
+    if (len + 8 > sizeof(body)) { if (++g_dropped <= 10) logf("lan: packet of %u bytes too large; dropped", len); return; }
+    uint32_t seq = ++g_game_seq;
+    memcpy(body, &port, 4);
+    memcpy(body + 4, &seq, 4);
+    memcpy(body + 8, buf, len);
+    raw_send(addr, t_game, body, len + 8);
+    g_sent++;
+    log_packet("sent", to, port, len);
+}
+
+static bool same_machine(const sockaddr_in &a, const sockaddr_in &b)
+{
+    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
+// The client was told it's no longer in the host's game (or lost it).
+static void dropped_by_host(const char *why)
+{
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_peers.clear();
+        g_left_reason = why;
+    }
+    g_welcomed = false;
+    g_role = k_off;
+    g_end_ready = true; // if it's in the game, leave it
+    logf("lan: %s", why);
+}
+
+static void receive_thread()
+{
+    static std::vector<char> buffer(65536);
+    char *packet = buffer.data();
+    for (;;)
+    {
+        sockaddr_in from = {};
+        int from_len = sizeof(from);
+        int n = recvfrom(g_sock, packet, (int)buffer.size(), 0, (sockaddr *)&from, &from_len);
+        if (n == SOCKET_ERROR)
+        {
+            int e = WSAGetLastError();
+            if (e == WSAECONNRESET || e == WSAEMSGSIZE) continue; // a peer went away; a stray datagram
+            logf("lan: receive failed (error %d); LAN play stopped", e);
+            return;
+        }
+        if (n < (int)sizeof(header)) continue;
+        header h;
+        memcpy(&h, packet, sizeof(h));
+        if (h.magic != k_magic || h.version != k_version || h.from == g_my_id) continue;
+        const char *body = packet + sizeof(h);
+        int len = n - (int)sizeof(h);
+        static std::vector<char> whole;
+        if (h.type == t_frag)
+        {
+            uint16_t inner = 0;
+            if (!reassemble(h.from, body, len, whole, inner)) continue;
+            h.type = inner;
+            body = whole.data();
+            len = (int)whole.size();
+        }
+        int role = g_role;
+        switch (h.type)
+        {
+        case t_game:
+        {
+            if (len < 8 || !find_peer(h.from, nullptr)) break;
+            uint32_t port, seq;
+            memcpy(&port, body, 4);
+            memcpy(&seq, body + 4, 4);
+            {
+                int slot = 0;
+                while (slot < 15 && g_seq_peer[slot] && g_seq_peer[slot] != h.from) slot++;
+                if (g_seq_peer[slot] != h.from) g_seq_peer[slot] = h.from, g_last_seq_from[slot] = seq - 1;
+                uint32_t expect = g_last_seq_from[slot] + 1;
+                if (seq == expect) g_last_seq_from[slot] = seq;
+                else if ((int32_t)(seq - expect) > 0)
+                {
+                    g_lost += seq - expect;
+                    if (g_verbose_log) logf("lan: %u game packet(s) from %llx lost on the way", seq - expect, (unsigned long long)h.from);
+                    g_last_seq_from[slot] = seq;
+                }
+                else g_late++;
+            }
+            net_deliver(body + 8, (uint32_t)(len - 8), h.from, port);
+            g_received++;
+            log_packet("received", h.from, port, (uint32_t)(len - 4));
+            break;
+        }
+        case t_find: // someone is looking for games
+        {
+            if (role != k_host) break;
+            lobby_msg m;
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                m = g_lobby_out;
+            }
+            raw_send(from, t_here, &m, sizeof(m));
+            break;
+        }
+        case t_here:
+        {
+            if (len < (int)sizeof(lobby_msg) || ms() > g_searching_until) break;
+            std::lock_guard<std::mutex> l(g_lock);
+            found_game *f = nullptr;
+            for (auto &g : g_found)
+                if (g.id == h.from) f = &g;
+            if (!f) g_found.push_back({}), f = &g_found.back();
+            f->id = h.from, f->addr = from, f->seen = ms();
+            memcpy(&f->info, body, sizeof(lobby_msg));
+            break;
+        }
+        case t_hello: // a machine joining (or still there)
+        {
+            if (role != k_host)
+            {
+                raw_send(from, t_bye, nullptr, 0); // not hosting (any more)
+                break;
+            }
+            std::string name = field(body, std::min(len, 32));
+            hello_msg hm = {};
+            if (len >= (int)sizeof(hello_msg)) memcpy(&hm, body, sizeof(hm));
+            bool is_new = true, full = false;
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                for (auto &p : g_peers)
+                    if (p.id == h.from) p.addr = from, p.name = name, p.heard = ms(), p.key = hm.key, p.status = hm.status, is_new = false;
+                if (is_new)
+                {
+                    if (g_peers.size() < 15) g_peers.push_back({h.from, from, name, ms(), hm.key, hm.status});
+                    else full = true;
+                }
+            }
+            if (full) break;
+            if (is_new) logf("lan: %s joined from %s (address %llx)", name.c_str(), ip_text(from).c_str(), (unsigned long long)h.from);
+            char reply[32];
+            put(reply, sizeof reply, g_name);
+            raw_send(from, t_welcome, reply, sizeof(reply));
+            break;
+        }
+        case t_welcome:
+        {
+            if (role != k_client || !same_machine(from, g_join_addr)) break;
+            std::string name = field(body, std::min(len, 32));
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                g_peers.assign(1, {h.from, from, name, ms()});
+            }
+            g_host_heard = ms();
+            if (!g_welcomed.exchange(true))
+                logf("lan: joined %s at %s (address %llx)", name.c_str(), ip_text(from).c_str(), (unsigned long long)h.from);
+            break;
+        }
+        case t_lobby:
+        {
+            if (role != k_client || len < (int)sizeof(lobby_msg) || !find_peer(h.from, nullptr)) break;
+            std::lock_guard<std::mutex> l(g_lock);
+            memcpy(&g_lobby_in, body, sizeof(lobby_msg));
+            g_host_heard = ms();
+            break;
+        }
+        case t_start:
+        {
+            if (role != k_client || !find_peer(h.from, nullptr) || len < (int)k_start_head) break;
+            // The host sends each start a few times; only the first copy counts.
+            uint32_t id, size;
+            memcpy(&id, body + offsetof(start_msg, game_id), sizeof(id));
+            memcpy(&size, body + offsetof(start_msg, variant_size), sizeof(size));
+            if (id == g_last_game_id || size > sizeof(start_msg::variant_data) || (size_t)len < k_start_head + size) break;
+            g_last_game_id = id;
+            std::lock_guard<std::mutex> l(g_start_lock);
+            memcpy(&g_start, body, k_start_head + size);
+            g_start_ready = true;
+            break;
+        }
+        case t_map:
+        {
+            if (role != k_client || !find_peer(h.from, nullptr) || len < (int)offsetof(map_msg, data)) break;
+            uint32_t id, size;
+            memcpy(&id, body + offsetof(map_msg, game_id), sizeof(id));
+            memcpy(&size, body + offsetof(map_msg, size), sizeof(size));
+            if (size > sizeof(map_msg::data) || (size_t)len < offsetof(map_msg, data) + size) break;
+            std::lock_guard<std::mutex> l(g_start_lock);
+            if (g_map_in.game_id == id && g_map_in.size == size) break;
+            memcpy(&g_map_in, body, offsetof(map_msg, data) + size);
+            break;
+        }
+        case t_end:
+            if (role == k_client && find_peer(h.from, nullptr)) g_end_ready = true;
+            break;
+        case t_save: // a piece of the host's saved game (co-op continue)
+        {
+            if (role != k_client || len < (int)sizeof(save_piece) || !find_peer(h.from, nullptr)) break;
+            save_piece sp;
+            memcpy(&sp, body, sizeof(sp));
+            if (!sp.total || sp.total > k_piece * k_most_pieces || sp.pieces != (sp.total + k_piece - 1) / k_piece ||
+                sp.index >= sp.pieces)
+                break;
+            uint32_t at = sp.index * k_piece, size = std::min(k_piece, sp.total - at);
+            if ((size_t)len < sizeof(sp) + size) break;
+            std::lock_guard<std::mutex> l(g_start_lock);
+            if (g_save_in_id != sp.game_id || g_save_in.size() != sp.total)
+            {
+                g_save_in_id = sp.game_id;
+                g_save_in.assign(sp.total, 0);
+                g_save_in_have.assign(k_most_pieces / 8, 0);
+            }
+            memcpy(g_save_in.data() + at, body + sizeof(sp), size);
+            g_save_in_have[sp.index / 8] |= (uint8_t)(1 << (sp.index % 8));
+            break;
+        }
+        case t_save_query: // the host asks which pieces arrived
+        {
+            if (role != k_client || len < 4 || !find_peer(h.from, nullptr)) break;
+            static save_status st;
+            memset(&st, 0, sizeof(st));
+            memcpy(&st.game_id, body, 4);
+            {
+                std::lock_guard<std::mutex> l(g_start_lock);
+                if (g_save_in_id == st.game_id && !g_save_in_have.empty()) memcpy(st.have, g_save_in_have.data(), sizeof(st.have));
+            }
+            raw_send(from, t_save_status, &st, sizeof(st));
+            break;
+        }
+        case t_save_status:
+        {
+            if (role != k_host || len < (int)sizeof(save_status)) break;
+            save_status st;
+            memcpy(&st, body, sizeof(st));
+            std::lock_guard<std::mutex> l(g_lock);
+            save_report *r = nullptr;
+            for (auto &x : g_save_reports)
+                if (x.id == h.from) r = &x;
+            if (!r) g_save_reports.push_back({h.from, 0, {}, 0}), r = &g_save_reports.back();
+            r->game_id = st.game_id;
+            r->have.assign(st.have, st.have + sizeof(st.have));
+            r->answers++;
+            break;
+        }
+        case t_save_offer: // the host is about to send its saved game: use what's here
+        {
+            if (role != k_client || len < (int)offsetof(save_offer, hash) || !find_peer(h.from, nullptr)) break;
+            static save_offer so;
+            memset(&so, 0, sizeof(so));
+            memcpy(&so, body, std::min<size_t>(len, sizeof(so)));
+            if (!so.total || so.total > k_piece * k_most_pieces || so.pieces != (so.total + k_piece - 1) / k_piece ||
+                (size_t)len < offsetof(save_offer, hash) + so.pieces * sizeof(uint64_t))
+                break;
+            {
+                std::lock_guard<std::mutex> l(g_start_lock);
+                if (g_save_in_id == so.game_id && g_save_in.size() == so.total) break; // already set up
+            }
+            std::string mine = g_read_coop_save ? g_read_coop_save(field(so.game, sizeof(so.game)).c_str()) : std::string();
+            std::lock_guard<std::mutex> l(g_start_lock);
+            g_save_in_id = so.game_id;
+            g_save_in.assign(so.total, 0);
+            g_save_in_have.assign(k_most_pieces / 8, 0);
+            uint32_t same = 0;
+            for (uint32_t i = 0; i < so.pieces; i++)
+            {
+                uint32_t at = i * k_piece, size = std::min(k_piece, so.total - at);
+                if (at + size > mine.size() || fnv64(mine.data() + at, size) != so.hash[i]) continue;
+                memcpy(g_save_in.data() + at, mine.data() + at, size);
+                g_save_in_have[i / 8] |= (uint8_t)(1 << (i % 8));
+                same++;
+            }
+            // Mostly the same: it's this machine's save of the host's checkpoint. Continue
+            // from it, and tell the host it has everything.
+            if (mine.size() == so.total && same * 2 >= so.pieces)
+            {
+                g_save_own_id = so.game_id;
+                g_save_own.assign(mine.begin(), mine.end());
+                for (uint32_t i = 0; i < so.pieces; i++) g_save_in_have[i / 8] |= (uint8_t)(1 << (i % 8));
+                logf("lan: the host's co-op saved game: %u of %u piece(s) the same as this machine's; continuing from this machine's own", same,
+                     so.pieces);
+            }
+            else
+                logf("lan: the host's co-op saved game: %u of %u piece(s) already here; getting the rest", same, so.pieces);
+            break;
+        }
+        case t_bye:
+            if (role == k_host)
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                for (size_t i = 0; i < g_peers.size(); i++)
+                    if (g_peers[i].id == h.from)
+                    {
+                        logf("lan: %s left", g_peers[i].name.c_str());
+                        g_peers.erase(g_peers.begin() + i);
+                        break;
+                    }
+            }
+            else if (role == k_client && (find_peer(h.from, nullptr) || same_machine(from, g_join_addr)))
+                dropped_by_host(g_welcomed ? "The host closed the game" : "That machine isn't hosting a game");
+            break;
+        }
+    }
+}
+
+// Where a "who's hosting?" goes: everywhere on this machine's networks.
+static std::vector<sockaddr_in> broadcast_addresses()
+{
+    std::vector<sockaddr_in> out;
+    sockaddr_in all = {};
+    all.sin_family = AF_INET;
+    all.sin_port = htons(g_port);
+    all.sin_addr.s_addr = INADDR_BROADCAST;
+    out.push_back(all);
+    INTERFACE_INFO list[32];
+    DWORD bytes = 0;
+    if (WSAIoctl(g_sock, SIO_GET_INTERFACE_LIST, nullptr, 0, list, sizeof(list), &bytes, nullptr, nullptr) == 0)
+        for (DWORD i = 0; i < bytes / sizeof(INTERFACE_INFO); i++)
+        {
+            const INTERFACE_INFO &f = list[i];
+            if (!(f.iiFlags & IFF_UP) || (f.iiFlags & IFF_LOOPBACK) || f.iiAddress.Address.sa_family != AF_INET) continue;
+            sockaddr_in b = all;
+            b.sin_addr.s_addr = f.iiAddress.AddressIn.sin_addr.s_addr | ~f.iiNetmask.AddressIn.sin_addr.s_addr;
+            if (b.sin_addr.s_addr != INADDR_BROADCAST) out.push_back(b);
+        }
+    return out;
+}
+
+// Every quarter second: joining machines say hello, the host tells them about its game
+// and forgets machines it hasn't heard from, and the join page looks for games.
+static void tick_thread()
+{
+    int64_t last_hello = 0, last_lobby = 0, last_find = 0;
+    hello_msg hello;
+    uint64_t last_sent = 0, last_received = 0, last_lost = 0;
+    int64_t last_stats = 0, qpc_start = 0, tick_start = 0;
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    for (;;)
+    {
+        Sleep(250);
+        int64_t t = ms();
+        int role = g_role;
+        // With verbose_log, in a LAN game: traffic each second, and both clocks (a game
+        // that thinks the other machine went quiet may be seeing a clock that drifts).
+        if (g_verbose_log && !g_seats.empty() && t - last_stats >= 1000)
+        {
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            if (!last_stats) qpc_start = q.QuadPart, tick_start = t;
+            uint64_t s = g_sent, r = g_received, l = g_lost;
+            logf("lan stats: sent %llu, received %llu, lost %llu in the last second; clocks: tick %lld ms, qpc %lld ms",
+                 (unsigned long long)(s - last_sent), (unsigned long long)(r - last_received), (unsigned long long)(l - last_lost),
+                 (long long)(t - tick_start), (long long)((q.QuadPart - qpc_start) * 1000 / qf.QuadPart));
+            last_sent = s, last_received = r, last_lost = l, last_stats = t;
+        }
+        if (g_seats.empty()) last_stats = 0, last_sent = last_received = last_lost = 0;
+        if (role == k_client)
+        {
+            if (t - last_hello >= 1000)
+            {
+                memset(&hello, 0, sizeof hello);
+                put(hello.name, sizeof hello.name, g_name);
+                lobby_msg in;
+                {
+                    std::lock_guard<std::mutex> l(g_lock);
+                    in = g_lobby_in;
+                }
+                hello.key = in.key;
+                hello.status = (uint8_t)(g_check_lobby && in.game[0] ? g_check_lobby(in.game, in.map_file) : 0);
+                raw_send(g_join_addr, t_hello, &hello, sizeof(hello));
+                last_hello = t;
+            }
+            if (g_welcomed && t - g_host_heard > 10000) dropped_by_host("Lost contact with the host");
+        }
+        if (role == k_host && t - last_lobby >= 1000)
+        {
+            last_lobby = t;
+            std::vector<peer> peers;
+            lobby_msg m;
+            {
+                std::lock_guard<std::mutex> l(g_lock);
+                for (size_t i = 0; i < g_peers.size();)
+                    if (t - g_peers[i].heard > 12000)
+                    {
+                        logf("lan: lost contact with %s", g_peers[i].name.c_str());
+                        g_peers.erase(g_peers.begin() + i);
+                    }
+                    else i++;
+                peers = g_peers;
+                g_lobby_out.count = (uint8_t)std::min<size_t>(16, peers.size() + 1);
+                put(g_lobby_out.host, 32, g_name);
+                put(g_lobby_out.names[0], 32, g_name);
+                g_lobby_out.status[0] = 1;
+                for (size_t i = 0; i < peers.size() && i < 15; i++)
+                {
+                    put(g_lobby_out.names[i + 1], 32, peers[i].name);
+                    g_lobby_out.status[i + 1] = peers[i].key == g_lobby_out.key ? peers[i].status : 0;
+                }
+                m = g_lobby_out;
+            }
+            for (const auto &p : peers) raw_send(p.addr, t_lobby, &m, sizeof(m));
+        }
+        if (t < g_searching_until && t - last_find >= 1000)
+        {
+            last_find = t;
+            for (const auto &a : broadcast_addresses()) raw_send(a, t_find, nullptr, 0);
+            std::lock_guard<std::mutex> l(g_lock);
+            g_found.erase(std::remove_if(g_found.begin(), g_found.end(), [t](const found_game &f) { return t - f.seen > 4000; }),
+                          g_found.end());
+        }
+    }
+}
+
+// The socket and threads, the first time LAN play is used.
+static bool open()
+{
+    if (g_opened) return g_sock != INVALID_SOCKET;
+    g_opened = true;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa)) { logf("lan: no network (WSAStartup failed)"); g_problem = "no network"; return false; }
+    if (g_name.empty())
+    {
+        wchar_t computer[64];
+        DWORD n = 64;
+        g_name = GetComputerNameW(computer, &n) ? narrow(computer) : "Player";
+    }
+    // A machine address nobody else will have; the top byte marks it as ours. New each
+    // session: nothing kept needs it (a co-op save would, but they aren't kept), and a
+    // file holding it could be copied to a second machine along with the folder.
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    uint64_t r = (uint64_t)t.QuadPart * 0x9E3779B97F4A7C15ull ^ ((uint64_t)GetCurrentProcessId() << 32) ^ GetTickCount64();
+    for (char c : g_name) r = (r ^ (uint8_t)c) * 0x100000001b3ull;
+    g_my_id = (0x08ull << 56) | (r & 0x00FFFFFFFFFFFFFFull);
+    g_cfg.address = g_my_id;
+
+    g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_sock == INVALID_SOCKET) { g_problem = "no network"; return false; }
+    sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(g_port);
+    if (bind(g_sock, (sockaddr *)&local, sizeof(local)))
+    {
+        // Something else has the port: this machine can still join games.
+        g_port_taken = true;
+        local.sin_port = 0;
+        if (bind(g_sock, (sockaddr *)&local, sizeof(local)))
+        {
+            logf("lan: cannot open a UDP port (error %d)", WSAGetLastError());
+            g_problem = "can't open a network port";
+            closesocket(g_sock);
+            g_sock = INVALID_SOCKET;
+            return false;
+        }
+        logf("lan: UDP port %u is in use (is Installation 08 already running?); joining only", g_port);
+    }
+    BOOL yes = TRUE;
+    setsockopt(g_sock, SOL_SOCKET, SO_BROADCAST, (const char *)&yes, sizeof(yes));
+    int big = 1 << 20;
+    setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof(big));
+    setsockopt(g_sock, SOL_SOCKET, SO_SNDBUF, (const char *)&big, sizeof(big));
+    {
+        int got = 0, gs = 0;
+        int n1 = sizeof(got), n2 = sizeof(gs);
+        getsockopt(g_sock, SOL_SOCKET, SO_RCVBUF, (char *)&got, &n1);
+        getsockopt(g_sock, SOL_SOCKET, SO_SNDBUF, (char *)&gs, &n2);
+        logf("lan: socket buffers %d bytes in, %d out", got, gs);
+    }
+    std::thread(receive_thread).detach();
+    std::thread(tick_thread).detach();
+    logf("lan: network ready as \"%s\", address %llx, UDP port %u", g_name.c_str(), (unsigned long long)g_my_id,
+         g_port_taken ? 0 : g_port);
+    return true;
+}
+
+// ---- Called from the menus (main thread).
+static bool host_open()
+{
+    if (!open()) return false;
+    if (g_port_taken)
+    {
+        g_problem = "port " + std::to_string(g_port) + " is in use, so others can't reach a game hosted here";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_peers.clear();
+        g_lobby_out = {};
+    }
+    g_problem.clear();
+    g_role = k_host;
+    logf("lan: hosting a game");
+    return true;
+}
+
+static void host_close()
+{
+    if (g_role != k_host) return;
+    std::vector<peer> peers;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        peers.swap(g_peers);
+    }
+    for (int round = 0; round < 3; round++)
+        for (const auto &p : peers) raw_send(p.addr, t_bye, nullptr, 0);
+    g_role = k_off;
+    logf("lan: stopped hosting");
+}
+
+// The host's game, as the menu shows it.
+static void set_lobby(const std::string &game, const std::string &map, const std::string &variant, bool playing, int mode = 0,
+                      int difficulty = 0, const std::string &map_file = "", const std::string &detail = "")
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    put(g_lobby_out.game, sizeof g_lobby_out.game, game);
+    put(g_lobby_out.map, sizeof g_lobby_out.map, map);
+    put(g_lobby_out.variant, sizeof g_lobby_out.variant, variant);
+    put(g_lobby_out.map_file, sizeof g_lobby_out.map_file, map_file);
+    put(g_lobby_out.detail, sizeof g_lobby_out.detail, detail);
+    g_lobby_out.playing = playing;
+    g_lobby_out.mode = (uint8_t)mode;
+    g_lobby_out.difficulty = (uint8_t)difficulty;
+    uint32_t key = 2166136261u;
+    for (char c : game + "/" + map_file) key = (key ^ (uint8_t)c) * 16777619u;
+    g_lobby_out.key = key | 1;
+}
+
+// Host: the players who joined, with whether each can play the lobby's choice.
+struct lobby_player { uint64_t id; std::string name; int status; };
+static std::vector<lobby_player> lobby_players()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    std::vector<lobby_player> out;
+    for (const auto &p : g_peers) out.push_back({p.id, p.name, p.key == g_lobby_out.key ? p.status : 0});
+    return out;
+}
+
+static void set_playing(bool playing)
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    g_lobby_out.playing = playing;
+}
+
+static bool join(const sockaddr_in &addr, const std::string &text)
+{
+    if (!open()) return false;
+    if (g_role == k_host) host_close();
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_peers.clear();
+        g_lobby_in = {};
+        g_left_reason.clear();
+    }
+    g_join_addr = addr;
+    g_join_text = text;
+    g_welcomed = false;
+    g_start_ready = false;
+    g_end_ready = false;
+    g_role = k_client;
+    logf("lan: joining %s (%s)", text.c_str(), ip_text(addr).c_str());
+    return true;
+}
+
+// An address someone typed: "192.168.1.20", a machine's name, or either with ":port".
+static bool join_text(const std::string &text)
+{
+    std::string host = text;
+    uint16_t port = g_port;
+    size_t colon = host.find(':');
+    if (colon != std::string::npos) port = (uint16_t)atoi(host.c_str() + colon + 1), host.resize(colon);
+    if (!open()) return false;
+    addrinfo hints = {}, *found = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (host.empty() || getaddrinfo(host.c_str(), nullptr, &hints, &found) || !found)
+    {
+        logf("lan: cannot find %s", text.c_str());
+        std::lock_guard<std::mutex> l(g_lock);
+        g_left_reason = "Can't find " + text;
+        return false;
+    }
+    sockaddr_in a = *(sockaddr_in *)found->ai_addr;
+    a.sin_port = htons(port ? port : g_port);
+    freeaddrinfo(found);
+    return join(a, text);
+}
+
+static void leave()
+{
+    if (g_role != k_client) return;
+    sockaddr_in to = g_join_addr;
+    g_role = k_off;
+    g_welcomed = false;
+    for (int round = 0; round < 3; round++) raw_send(to, t_bye, nullptr, 0);
+    std::lock_guard<std::mutex> l(g_lock);
+    g_peers.clear();
+    logf("lan: left the game");
+}
+
+static void search()
+{
+    if (!open()) return;
+    g_searching_until = ms() + 3000;
+}
+
+static std::vector<found_game> found()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    std::vector<found_game> out = g_found;
+    std::sort(out.begin(), out.end(), [](const found_game &a, const found_game &b) { return strcmp(a.info.host, b.info.host) < 0; });
+    return out;
+}
+
+static std::vector<std::string> joined_names()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    std::vector<std::string> out;
+    for (const auto &p : g_peers) out.push_back(p.name);
+    return out;
+}
+
+static lobby_msg host_lobby()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    return g_lobby_in;
+}
+
+static std::string left_reason()
+{
+    std::lock_guard<std::mutex> l(g_lock);
+    return g_left_reason;
+}
+
+// From the command line: --lan host | --lan <address>.
+static void start(const std::wstring &what)
+{
+    if (!_wcsicmp(what.c_str(), L"host")) host_open();
+    else if (!join_text(narrow(what.c_str()))) g_problem = "can't find the host " + narrow(what.c_str());
+}
+
+// Leaving Installation 08: tell the others.
+static void shutdown()
+{
+    if (g_role == k_host) host_close();
+    else leave();
+}
+
+static void log_totals()
+{
+    if (g_sent || g_received)
+        logf("lan: %llu packets sent, %llu received, %llu dropped here, %llu lost on the way, %llu out of order",
+             (unsigned long long)g_sent.load(), (unsigned long long)g_received.load(), (unsigned long long)g_dropped.load(),
+             (unsigned long long)g_lost.load(), (unsigned long long)g_late.load());
+    g_sent = g_received = g_dropped = g_lost = g_late = 0;
+    memset(g_seq_peer, 0, sizeof g_seq_peer);
+    g_logged = 0;
+}
+} // namespace lan
+
 static uint32_t net_send(uint64_t id, const char *buf, uint32_t len, uint32_t port)
 {
     if (!buf || !len) return 0;
-    if (g_module != 0) return len; // only Halo CE needs it; the others never get packets
-    if (id != (uint64_t)g_cfg.address && id != 0) return len; // nobody else is out there
-    std::lock_guard<std::mutex> l(g_net_lock);
-    if (g_net_queue.size() > 4096) g_net_queue.pop_front();
-    g_net_queue.push_back({std::vector<char>(buf, buf + len), (uint64_t)g_cfg.address, port});
-    return len;
+    // Outside a LAN game only Halo CE needs its own packets back (its server and client
+    // talk through here); the other games are left as they were.
+    if (g_module != 0 && lan::g_seats.empty()) return len;
+    uint64_t me = g_cfg.address;
+    uint64_t to = id ? id : (lan::g_seats.empty() ? me : lan::g_seats[0].address);
+    if (to == me) net_deliver(buf, len, me, port);
+    else if (lan::g_role != lan::k_off) lan::send_game(to, port, buf, len);
+    return len; // nobody else is out there
 }
 static uint32_t h_network_sendto_unreliable(void *, uint64_t id, const char *buf, uint32_t len, uint32_t port)
 {
@@ -416,6 +1465,9 @@ static void h_restart_game(void *, int reason, const char *message)
 // in the game options to continue. Stored as saves\<game>.sav, with a small
 // <game>.sav.info beside it saying which mission and difficulty it belongs to.
 static std::wstring save_path(const std::wstring &game) { return g_cfg.host_dir + L"\\saves\\" + game + L".sav"; }
+// LAN co-op checkpoints, kept apart from the solo saved game (every machine in the game
+// keeps one, so any of them can host the next session).
+static std::wstring coop_save_path(const std::wstring &game) { return g_cfg.host_dir + L"\\saves\\" + game + L".coop.sav"; }
 static void on_game_saved();                 // defined with the menus
 // "Quit without saving": saves made from then on are ignored, and the save the game
 // had when this session started is put back.
@@ -449,17 +1501,24 @@ static int current_map_for_save();
 static std::string current_file_for_save();
 
 static int g_mode_for_saves = 1;
+// Continuing a LAN co-op game from a checkpoint. Off: Halo 3 won't (started from a saved
+// game on every machine it never goes online; on the host only, it ignores the save),
+// and the others are untested. The saving, sending and loading are kept for a game that can.
+static const bool k_coop_continue = false;
+static std::atomic<int> g_game_run; // counts games started, for things done once a game
 static void h_save_game(void *, const char *buf, uint32_t len)
 {
     if (g_mode_for_saves != 1) { logf("host.save_game: not a campaign, not kept (%u bytes)", len); return; }
-    logf("host.save_game %u bytes", len);
+    bool coop = !lan::g_seats.empty();
+    if (coop && !k_coop_continue) { logf("host.save_game %u bytes (LAN co-op): not kept", len); return; }
+    logf("host.save_game %u bytes%s", len, coop ? " (LAN co-op)" : "");
     if (!buf || !len) return;
-    if (g_discard_session) { logf("not kept (quitting without saving)"); return; }
+    if (!coop && g_discard_session) { logf("not kept (quitting without saving)"); return; }
     // Halo CE sometimes hands over a 1-byte "save" at a mission's start; keeping it
     // would replace a real saved game with nothing to continue from.
     if (len < 4096) { logf("not kept (too small to be a saved game)"); return; }
     CreateDirectoryW((g_cfg.host_dir + L"\\saves").c_str(), nullptr);
-    std::wstring path = save_path(g_cfg.game), temp = path + L".new";
+    std::wstring path = coop ? coop_save_path(g_cfg.game) : save_path(g_cfg.game), temp = path + L".new";
     bool ok = false;
     if (FILE *f = _wfopen(temp.c_str(), L"wb"))
     {
@@ -479,8 +1538,40 @@ static void h_save_game(void *, const char *buf, uint32_t len)
                 current_file_for_save().c_str(), g_cfg.difficulty, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
         fclose(f);
     }
-    logf("saved game written (%s)", current_file_for_save().c_str());
-    on_game_saved();
+    logf("%s written (%s)", coop ? "co-op saved game" : "saved game", current_file_for_save().c_str());
+    // Once a game: where the machines' addresses are in a co-op save (to check that
+    // continuing gives the game back the machines it expects).
+    static int s_scanned_for = -1;
+    if (coop && s_scanned_for != g_game_run)
+    {
+        s_scanned_for = g_game_run;
+        std::vector<std::pair<std::string, uint64_t>> look;
+        for (size_t i = 0; i < lan::g_seats.size(); i++)
+            look.push_back({"machine " + std::to_string(i), lan::g_seats[i].address});
+        if (!lan::g_seats.empty()) look.push_back({"session", lan::g_seats[0].address ^ 0x4930384C414E0001ull});
+        std::string out;
+        for (const auto &l : look)
+        {
+            int count = 0;
+            std::string at;
+            for (uint32_t o = 0; o + 8 <= len; o++)
+            {
+                if ((uint8_t)buf[o] != (uint8_t)l.second) continue;
+                uint64_t v;
+                memcpy(&v, buf + o, 8);
+                if (v != l.second) continue;
+                if (count++ < 4)
+                {
+                    char t[24];
+                    snprintf(t, sizeof t, "%s%x", at.empty() ? "" : " ", o);
+                    at += t;
+                }
+            }
+            out += "; " + l.first + (l.second == lan::g_my_id ? " (this one)" : "") + ": " + std::to_string(count) + (count ? " at " + at : "");
+        }
+        logf("co-op save: addresses in it%s", out.c_str());
+    }
+    if (!coop) on_game_saved();
 }
 
 
@@ -551,10 +1642,16 @@ struct s_general_video_settings
     char rest[16];
 };
 
+// The graphics choices in MCC's video settings, as the games read them (bytes 8 to
+// 0x16 of s_general_video_settings; quality 0 low, 1 medium, 2 high; frame rate limit
+// 0: 60, 1: 120, 2: 180, 3: 240, 4: none). Filled from the settings (apply_settings).
+static unsigned char g_video_choices[24];
+static std::atomic<bool> g_subtitles{false};
 static bool h_get_video_setting(void *, unsigned char *settings)
 {
     LOG_CALL(32, "host.get_video_setting");
     memset(settings, 0, 368);
+    memcpy(settings, g_video_choices, sizeof g_video_choices);
     auto *general = reinterpret_cast<s_general_video_settings *>(settings);
     general->width = g_cfg.width;
     general->height = g_cfg.height;
@@ -582,7 +1679,6 @@ static void *h_get_player_profile(void *, XUID xuid)
 // the game fills in what it last saw and takes back whatever the host returns, so the
 // host decides. Whichever device was used last wins, as in MCC.
 static int g_input_connected = 1;
-static HWND g_hwnd;
 
 // Keys and mouse buttons held down in our window, from its own window messages (the
 // way games normally read the keyboard), indexed by virtual-key code.
@@ -651,8 +1747,84 @@ static int pad_for_player(int player)
 }
 namespace menu { static bool filter_input(struct s_host_input_state *state); static bool menu_blocking(); }
 
+// ---- Floating-point consistency (LAN co-op runs the same simulation on every machine,
+// so every machine must compute exactly alike).
+static unsigned fp_mxcsr()
+{
+    unsigned v = 0;
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+    return v;
+}
+static unsigned fp_x87()
+{
+    unsigned short v = 0;
+    __asm__ volatile("fnstcw %0" : "=m"(v));
+    return v;
+}
+static void log_fp_state(const char *where)
+{
+    static std::mutex m;
+    static std::map<std::string, std::pair<unsigned, unsigned>> seen;
+    unsigned a = fp_mxcsr(), b = fp_x87();
+    std::lock_guard<std::mutex> l(m);
+    auto it = seen.find(where);
+    if (it != seen.end() && it->second == std::make_pair(a, b)) return;
+    seen[where] = {a, b};
+    logf("fp: %s: MXCSR %04x, x87 control %04x", where, a, b);
+}
+// What the CPU offers and what the system lets programs use (the C runtime's math
+// picks its code path from these: FMA3 when it can).
+static bool g_wine_math; // the games' C runtime math is Wine's (PS5 without Microsoft's ucrtbase.dll)
+static void log_cpu()
+{
+    unsigned a, b, c, d;
+    char brand[49] = {};
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000), "c"(0));
+    if (a >= 0x80000004)
+        for (unsigned i = 0; i < 3; i++)
+        {
+            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000002 + i), "c"(0));
+            memcpy(brand + i * 16, &a, 4), memcpy(brand + i * 16 + 4, &b, 4), memcpy(brand + i * 16 + 8, &c, 4),
+                memcpy(brand + i * 16 + 12, &d, 4);
+        }
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    bool fma = c >> 12 & 1, avx = c >> 28 & 1, osxsave = c >> 27 & 1;
+    unsigned long long xcr0 = 0;
+    if (osxsave)
+    {
+        unsigned lo, hi;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        xcr0 = ((unsigned long long)hi << 32) | lo;
+    }
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+    bool avx2 = b >> 5 & 1, avx512 = b >> 16 & 1;
+    logf("cpu: %s; FMA3 %d, AVX %d, AVX2 %d, AVX-512 %d, OSXSAVE %d, XCR0 %llx", brand, fma, avx, avx2, avx512, osxsave, xcr0);
+    // Which C runtime the games' math comes from: Wine's own copy says so in its header.
+    HMODULE ucrt = LoadLibraryW(L"ucrtbase.dll");
+    bool wine_copy = false;
+    if (ucrt)
+    {
+        const char *base = (const char *)ucrt;
+        wine_copy = memcmp(base + 0x40, "Wine builtin DLL", 16) == 0 || memcmp(base + 0x40, "Wine placeholder DLL", 20) == 0;
+        g_wine_math = wine_copy;
+        // Every machine uses the same (non-FMA) math code path, whatever its CPU offers.
+        typedef int(__cdecl * t_set_fma3)(int);
+        t_set_fma3 set_fma3 = (t_set_fma3)GetProcAddress(ucrt, "_set_FMA3_enable");
+        typedef int(__cdecl * t_get_fma3)();
+        t_get_fma3 get_fma3 = (t_get_fma3)GetProcAddress(ucrt, "_get_FMA3_enable");
+        int before = get_fma3 ? get_fma3() : -1;
+        int set = set_fma3 ? set_fma3(0) : -1;
+        int after = get_fma3 ? get_fma3() : -1;
+        logf("cpu: C runtime ucrtbase.dll is %s; FMA3 math %d, set(0) -> %d, now %d", wine_copy ? "Wine's" : "Microsoft's", before,
+             set, after);
+    }
+    log_fp_state("main thread");
+}
+
 static bool h_get_input_state(void *, int player, unsigned char *raw)
 {
+    static bool fp_logged;
+    if (!fp_logged) fp_logged = true, log_fp_state("game thread");
     LOG_CALL(36, "host.get_input_state player=%d", player);
     if (!raw) return false;
     auto *state = reinterpret_cast<s_host_input_state *>(raw);
@@ -938,6 +2110,8 @@ static bool h_get_game_setting(void *, int setting, bool *v1, uint64_t *v2)
     if (v2) *v2 = 0;
     // 6: the font package MCC ships, maps\fonts\font_package_icon*.bin.
     if (setting == 6) { if (v1) *v1 = true; return true; }
+    // 5: subtitles.
+    if (setting == 5) { if (v1) *v1 = g_subtitles; return true; }
     return false;
 }
 
@@ -988,7 +2162,7 @@ static bool h_get_player_xuid(void *, XUID *xuid, wchar_t *name, int size, int p
 {
     LOG_CALL(88, "host.get_player_xuid player=%d", player);
     if (player < 0 || player >= g_local_players) return false;
-    if (xuid) *xuid = 0x0009000000000001ull + (uint64_t)player;
+    if (xuid) *xuid = player == 0 ? lan::g_my_xuid : 0x0009000000000001ull + (uint64_t)player;
     // "size" is in bytes for Halo CE (a 32-byte buffer) and may be in characters for
     // the others, so take it as bytes: the name fits either way. (wcsncpy padded the
     // rest with zeros, 64 bytes into Halo CE's 32, and broke its stack check.)
@@ -997,6 +2171,12 @@ static bool h_get_player_xuid(void *, XUID *xuid, wchar_t *name, int size, int p
         size_t room = (size_t)size / sizeof(wchar_t);
         wchar_t label[16];
         swprintf(label, 16, player == 0 ? L"Player" : L"Player %d", player + 1);
+        if (player == 0 && !lan::g_name.empty())
+        {
+            int n = MultiByteToWideChar(CP_UTF8, 0, lan::g_name.c_str(), -1, label, 16);
+            if (n <= 0) wcscpy(label, L"Player");
+            label[15] = 0;
+        }
         size_t n = std::min(wcslen(label), room - 1);
         memcpy(name, label, n * sizeof(wchar_t));
         name[n] = 0;
@@ -1478,9 +2658,106 @@ struct host_settings
     int players = 1;      // campaign split-screen players
     int keyboard_player = 0; // split-screen: the keyboard is player 1 on its own
     int split_session = 0;   // split-screen: list every player in the launch options
+    int coop_continue_all = 0; // LAN co-op continue: every machine loads the saved game (0: the host only)
     int difficulty = 1;
+    std::string lan_address; // the last address joined by hand
+    std::string lan_name;    // the player's name: in the games and in LAN lobbies (default: the computer's name)
+    int name_asked = 0;      // the first-start "your name" question has been shown
+    std::map<std::string, std::string> look;      // "<game>_<slot>": armor or color, by MCC's item id
+    std::string service_tag;                      // up to 4 letters and digits
+    // Halo 4: primary, secondary, grenade, armor ability, tactical, support (the game's numbers).
+    // Until changed: Assault Rifle, Magnum, Frag, Hologram, Mobility, Ammo.
+    int loadout[5][6] = {{1, 5, 0, 7, 1, 11}, {1, 5, 0, 7, 1, 11}, {1, 5, 0, 7, 1, 11}, {1, 5, 0, 7, 1, 11}, {1, 5, 0, 7, 1, 11}};
+    bool loadout_set[5] = {};
+    std::map<std::string, std::string> map_variant; // "<game>_<map file>": the saved map last chosen (its file name)
+    std::map<std::string, float> opt;               // the MCC settings below (k_options), by key
 };
 static host_settings g_settings;
+
+// MCC's own settings (controls, video, audio, accessibility), as they reach the games:
+// fields of the player profile (s_player_profile) and of the video settings. Defaults
+// are MCC's (MCC-Win64-Shipping.exe+0x1c9868 builds its default profile).
+enum opt_kind
+{
+    o_bool,     // profile byte: 0 or 1
+    o_not,      // profile byte holding the opposite ("disabled" flags)
+    o_byte,     // profile byte: the number
+    o_int,      // profile int32: the number
+    o_float,    // profile float: the number / scale
+    o_video,    // video settings byte: the number
+    o_subtitle, // subtitles: profile byte 0 and the game setting
+};
+enum opt_page { op_controls, op_video, op_audio, op_access };
+struct opt_def
+{
+    const char *key;
+    opt_page page;
+    const wchar_t *label;
+    opt_kind kind;
+    int offset;
+    float lo, hi, step, def;
+    std::vector<const wchar_t *> names; // what each number is called (empty: the number)
+    float scale;                        // o_float: profile value = shown value / scale
+    const wchar_t *unit;                // after the number ("%")
+    const wchar_t *note;
+};
+static const std::vector<const wchar_t *> k_off_on = {L"Off", L"On"};
+static const std::vector<const wchar_t *> k_quality = {L"Low", L"Medium", L"High"};
+static const std::vector<opt_def> k_options = {
+    // Controls
+    {"look_horizontal", op_controls, L"Look sensitivity (horizontal)", o_byte, 0x1B6, 1, 10, 1, 4, {}, 1, L"", L"Controller"},
+    {"look_vertical", op_controls, L"Look sensitivity (vertical)", o_byte, 0x1B5, 1, 10, 1, 4, {}, 1, L"", L"Controller"},
+    {"look_acceleration", op_controls, L"Look acceleration", o_byte, 0x1B7, 0, 10, 1, 4, {}, 1, L"", L"Controller"},
+    {"axial_dead_zone", op_controls, L"Axial dead zone", o_float, 0x1B8, 0, 50, 1, 12, {}, 100, L"%", L"Controller: how far a stick moves before it counts, along each axis"},
+    {"radial_dead_zone", op_controls, L"Radial dead zone", o_float, 0x1BC, 0, 50, 1, 12, {}, 100, L"%", L"Controller: how far a stick moves before it counts, in any direction"},
+    {"zoom_sensitivity", op_controls, L"Zoomed look sensitivity", o_float, 0x1C0, 10, 200, 10, 100, {}, 100, L"%", L"Look speed while zoomed in, against normal"},
+    {"vehicle_sensitivity", op_controls, L"Vehicle look sensitivity", o_float, 0x1C4, 10, 200, 10, 100, {}, 100, L"%", L"Look speed in vehicles, against normal"},
+    {"invert_flight", op_controls, L"Invert flight controls (controller)", o_bool, 0x21, 0, 1, 1, 0, k_off_on, 1, L"", L""},
+    {"invert_flight_mouse", op_controls, L"Invert flight controls (mouse)", o_bool, 0x22, 0, 1, 1, 0, k_off_on, 1, L"", L""},
+    {"vibration", op_controls, L"Vibration", o_not, 0x1F, 0, 1, 1, 1, k_off_on, 1, L"", L""},
+    {"auto_center", op_controls, L"Look auto-centering", o_bool, 0x23, 0, 1, 1, 0, k_off_on, 1, L"", L"Levels your view when you move without looking up or down"},
+    {"hold_to_zoom", op_controls, L"Zoom", o_bool, 0x28, 0, 1, 1, 1, {L"Toggle", L"Hold"}, 1, L"", L""},
+    {"crouch_lock", op_controls, L"Crouch (controller)", o_bool, 0x24, 0, 1, 1, 0, {L"Hold", L"Toggle"}, 1, L"", L""},
+    {"crouch_lock_keyboard", op_controls, L"Crouch (keyboard)", o_bool, 0x25, 0, 1, 1, 0, {L"Hold", L"Toggle"}, 1, L"", L""},
+    {"clench_protection", op_controls, L"Clench protection", o_bool, 0x26, 0, 1, 1, 0, k_off_on, 1, L"", L"Stops a hard squeeze of the grip from pressing other buttons"},
+    {"double_jump_jetpack", op_controls, L"Double-press jump for jetpack", o_bool, 0x1D9, 0, 1, 1, 0, k_off_on, 1, L"", L"Halo: Reach and Halo 4"},
+    {"dual_wield_swap", op_controls, L"Swap dual-wield triggers", o_bool, 0x1DB, 0, 1, 1, 0, k_off_on, 1, L"", L"Halo 2 and Halo 3"},
+    {"mouse_smoothing", op_controls, L"Mouse smoothing", o_bool, 0x414, 0, 1, 1, 0, k_off_on, 1, L"", L""},
+    {"mouse_acceleration", op_controls, L"Mouse acceleration", o_bool, 0x415, 0, 1, 1, 0, k_off_on, 1, L"", L""},
+    // Video
+    {"vehicle_fov", op_video, L"Vehicle field of view", o_int, 0x18, 65, 120, 1, 78, {}, 1, L"", L"Field of view in vehicles"},
+    {"centered_crosshair", op_video, L"Crosshair", o_bool, 0x1C, 0, 1, 1, 0, {L"Default", L"Centered"}, 1, L"", L"Where the crosshair sits on the screen"},
+    {"lock_aspect", op_video, L"Lock maximum aspect ratio", o_bool, 0x39, 0, 1, 1, 1, k_off_on, 1, L"", L"Keeps the picture at 16:9 on wider screens"},
+    {"hud_scale", op_video, L"HUD scale", o_float, 0xAC8, 50, 100, 5, 100, {}, 1, L"%", L""},
+    {"frame_rate", op_video, L"Frame rate limit", o_video, 0x15, 0, 4, 1, 0, {L"60", L"120", L"180", L"240", L"None"}, 1, L"",
+     L"Higher limits need a fast enough machine (60 suits the PS5)"},
+    {"texture_quality", op_video, L"Texture quality", o_video, 0x08, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"texture_filtering", op_video, L"Texture filtering", o_video, 0x09, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"lighting_quality", op_video, L"Lighting quality", o_video, 0x0A, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"effects_quality", op_video, L"Effects quality", o_video, 0x0B, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"details_quality", op_video, L"Details quality", o_video, 0x0D, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"post_processing", op_video, L"Post-processing quality", o_video, 0x0E, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"water_quality", op_video, L"Water quality", o_video, 0x0F, 0, 2, 1, 2, k_quality, 1, L"", L"Takes effect from the next game you start"},
+    {"anti_aliasing", op_video, L"Anti-aliasing", o_video, 0x11, 0, 1, 1, 1, k_off_on, 1, L"", L"Takes effect from the next game you start"},
+    {"motion_blur", op_video, L"Motion blur", o_video, 0x12, 0, 1, 1, 1, k_off_on, 1, L"", L"Takes effect from the next game you start"},
+    // Audio
+    {"female_voice", op_audio, L"Spartan voice", o_bool, 0x27, 0, 1, 1, 0, {L"Male", L"Female"}, 1, L"", L"Halo: Reach"},
+    // Accessibility
+    {"subtitles", op_access, L"Subtitles", o_subtitle, 0x00, 0, 1, 1, 0, k_off_on, 1, L"", L""},
+    {"speaker_names", op_access, L"Speaker names in subtitles", o_bool, 0x07, 0, 1, 1, 1, k_off_on, 1, L"", L""},
+    {"subtitle_background", op_access, L"Subtitle background opacity", o_float, 0x0C, 0, 100, 10, 50, {}, 100, L"%", L""},
+    {"subtitle_shadow", op_access, L"Subtitle shadow opacity", o_float, 0x10, 0, 100, 10, 50, {}, 100, L"%", L""},
+    {"colorblind_mode", op_access, L"Color blind mode", o_int, 0xAB4, 0, 3, 1, 0, {L"Off", L"Protanopia", L"Deuteranopia", L"Tritanopia"}, 1, L"", L""},
+    {"colorblind_strength", op_access, L"Color blind filter strength", o_float, 0xAB8, 0, 100, 10, 100, {}, 100, L"%", L""},
+    {"colorblind_brightness", op_access, L"Color blind filter brightness", o_float, 0xABC, 0, 100, 5, 50, {}, 100, L"%", L""},
+    {"colorblind_contrast", op_access, L"Color blind filter contrast", o_float, 0xAC0, 0, 100, 5, 25, {}, 100, L"%", L""},
+};
+static float opt_value(const opt_def &o)
+{
+    auto it = g_settings.opt.find(o.key);
+    float v = it == g_settings.opt.end() ? o.def : it->second;
+    return std::max(o.lo, std::min(o.hi, v));
+}
 
 
 // ------------------------------------------------ controls (per game)
@@ -1521,6 +2798,8 @@ static const wchar_t *btn(const wchar_t *xbox)
     if (!playstation_labels()) return xbox;
     if (!wcscmp(xbox, L"A")) return L"Cross";
     if (!wcscmp(xbox, L"B")) return L"Circle";
+    if (!wcscmp(xbox, L"X")) return L"Square";
+    if (!wcscmp(xbox, L"Y")) return L"Triangle";
     if (!wcscmp(xbox, L"Start")) return L"Options";
     if (!wcscmp(xbox, L"Back")) return L"Create";
     return xbox;
@@ -1725,6 +3004,9 @@ static void load_settings()
         std::string k = key;
         float v = (float)atof(value);
         if (k == "master_volume") g_settings.master = (int)v;
+        else if (k == "lan_address") g_settings.lan_address = value;
+        else if (k == "lan_name" || k == "player_name") g_settings.lan_name = value;
+        else if (k == "name_asked") g_settings.name_asked = (int)v;
         else if (k == "music_volume") g_settings.music = (int)v;
         else if (k == "effects_volume") g_settings.effects = (int)v;
         else if (k == "mouse_sensitivity") g_settings.mouse = v;
@@ -1745,7 +3027,9 @@ static void load_settings()
         else if (k == "players") g_settings.players = (int)v;
         else if (k == "keyboard_player") g_settings.keyboard_player = (int)v;
         else if (k == "split_screen_session") g_settings.split_session = (int)v;
+        else if (k == "coop_continue_all") g_settings.coop_continue_all = (int)v;
         else if (k == "verbose_log") g_verbose_log = v != 0;
+        else if (k == "loading_screen") g_loading_screen = v != 0;
         else if (k == "last_game") g_settings.last_game = value;
         else if (k.rfind("pad_", 0) == 0)
         {
@@ -1773,6 +3057,16 @@ static void load_settings()
             g_key_overrides[k.substr(4, u - 4)][atoi(k.c_str() + u + 1)] = keys;
         }
         else if (k.rfind("last_map_", 0) == 0) g_settings.last_map[k.substr(9)] = (int)v;
+        else if (k.rfind("look_", 0) == 0) g_settings.look[k.substr(5)] = value;
+        else if (k == "service_tag") g_settings.service_tag = value;
+        else if (k.rfind("opt_", 0) == 0) g_settings.opt[k.substr(4)] = v;
+        else if (k.rfind("map_variant_", 0) == 0) g_settings.map_variant[k.substr(12)] = value;
+        else if (k.rfind("loadout_", 0) == 0 && k.size() == 9 && k[8] >= '1' && k[8] <= '5')
+        {
+            int n = k[8] - '1', i = 0;
+            for (const char *c = value; c && *c && i < 6; c = strchr(c, ','), c = c ? c + 1 : nullptr) g_settings.loadout[n][i++] = atoi(c);
+            g_settings.loadout_set[n] = true;
+        }
     }
     fclose(f);
     logf("settings loaded from installation08.ini");
@@ -1792,11 +3086,16 @@ static void save_settings()
     for (const auto &m : g_settings.ff_map) fprintf(f, "firefight_map_%s = %d\n", m.first.c_str(), m.second);
     for (const auto &m : g_settings.ff_variant) fprintf(f, "firefight_variant_%s = %s\n", m.first.c_str(), m.second.c_str());
     fprintf(f, "spartan_ops_mission = %d\n", g_settings.spops);
+    if (!g_settings.lan_address.empty()) fprintf(f, "lan_address = %s\n", g_settings.lan_address.c_str());
+    if (!g_settings.lan_name.empty()) fprintf(f, "player_name = %s\n", g_settings.lan_name.c_str());
+    if (g_settings.name_asked) fprintf(f, "name_asked = 1\n");
     if (g_settings.split_session) fprintf(f, "split_screen_session = 1\n");
+    if (g_settings.coop_continue_all) fprintf(f, "coop_continue_all = 1\n");
     for (const auto &m : g_settings.cg_map) fprintf(f, "custom_map_%s = %d\n", m.first.c_str(), m.second);
     for (const auto &m : g_settings.cg_variant) fprintf(f, "custom_variant_%s = %s\n", m.first.c_str(), m.second.c_str());
     if (!g_settings.last_game.empty()) fprintf(f, "last_game = %s\n", g_settings.last_game.c_str());
     if (g_verbose_log) fprintf(f, "verbose_log = 1\n");
+    if (!g_loading_screen) fprintf(f, "loading_screen = 0\n");
     for (const auto &g : g_pad_layouts)
     {
         if (g.second.is_default()) continue;
@@ -1813,6 +3112,18 @@ static void save_settings()
             fprintf(f, "\n");
         }
     for (const auto &m : g_settings.last_map) fprintf(f, "last_map_%s = %d\n", m.first.c_str(), m.second);
+    for (const auto &m : g_settings.look)
+        if (!m.second.empty()) fprintf(f, "look_%s = %s\n", m.first.c_str(), m.second.c_str());
+    if (!g_settings.service_tag.empty()) fprintf(f, "service_tag = %s\n", g_settings.service_tag.c_str());
+    for (const auto &o : g_settings.opt) fprintf(f, "opt_%s = %g\n", o.first.c_str(), o.second);
+    for (const auto &m : g_settings.map_variant)
+        if (!m.second.empty()) fprintf(f, "map_variant_%s = %s\n", m.first.c_str(), m.second.c_str());
+    for (int n = 0; n < 5; n++)
+        if (g_settings.loadout_set[n])
+        {
+            const int *l = g_settings.loadout[n];
+            fprintf(f, "loadout_%d = %d,%d,%d,%d,%d,%d\n", n + 1, l[0], l[1], l[2], l[3], l[4], l[5]);
+        }
     fclose(f);
 }
 
@@ -1831,6 +3142,355 @@ static void apply_settings()
     put<int32_t>(p, 0x14, g_settings.fov);
     put<int32_t>(p, 0x18, g_settings.fov);
     g_cfg.mouse_sensitivity = g_settings.mouse;
+    p[0x1DE] = 1; // color correction, as MCC sets it
+    for (const auto &o : k_options)
+    {
+        float v = opt_value(o);
+        switch (o.kind)
+        {
+        case o_bool: case o_byte: p[o.offset] = (unsigned char)(int)v; break;
+        case o_not: p[o.offset] = v ? 0 : 1; break;
+        case o_int: put<int32_t>(p, o.offset, (int32_t)v); break;
+        case o_float: put<float>(p, o.offset, v / o.scale); break;
+        case o_video: g_video_choices[o.offset] = (unsigned char)(int)v; break;
+        case o_subtitle: p[o.offset] = v ? 1 : 0; g_subtitles = v != 0; break;
+        }
+    }
+}
+
+// ------------------------------------------------ armor, colors, service tag, loadouts
+// MCC hands every game the player's look in the profile, each piece as MCC's own item
+// number (libmcc's e_customization_item); the game turns it into its own (Reach:
+// haloreach.dll+0x3b2f4, Halo 3: halo3.dll+0x2f628c). Item numbers and ids are MCC's.
+struct look_item { uint16_t id; const char *name; };
+static const look_item k_look_items[] = {
+#include "customization_items.inc"
+};
+enum { ls_colors, ls_armor, ls_elite, ls_other };
+struct look_slot
+{
+    const char *key;      // in the .ini: look_<game>_<key>
+    const wchar_t *label;
+    int section;
+    int offset;           // in the profile
+    std::vector<const char *> families; // item id prefixes (lower case)
+    int index_offset = -1; // colors: also the position in the game's list (Halo CE to Halo 3 read that)
+};
+static const std::vector<look_slot> &look_slots(int module)
+{
+    static const std::vector<look_slot> reach = {
+        {"primary", L"Primary color", ls_colors, 0x98, {"hr_color_"}, 0x2C},
+        {"secondary", L"Secondary color", ls_colors, 0x9C, {"hr_color_"}, 0x30},
+        {"helmet", L"Helmet", ls_armor, 0x40, {"hr_helmet_"}},
+        {"left_shoulder", L"Left shoulder", ls_armor, 0x44, {"hr_leftshoulder_"}},
+        {"right_shoulder", L"Right shoulder", ls_armor, 0x48, {"hr_rightshoulder_"}},
+        {"chest", L"Chest", ls_armor, 0x4C, {"hr_chest_"}},
+        {"wrist", L"Wrist", ls_armor, 0x50, {"hr_wrist_"}},
+        {"utility", L"Utility", ls_armor, 0x54, {"hr_utility_"}},
+        {"knees", L"Knee guards", ls_armor, 0x6C, {"hr_kneeguards_"}},
+        {"visor", L"Visor color", ls_armor, 0x70, {"hr_visorcolor_"}},
+        {"effect", L"Armor effect", ls_armor, 0x68, {"hr_armoreffect_"}},
+        {"body", L"Gender", ls_armor, 0x64, {"hr_spartan_"}},
+        {"elite", L"Elite armor", ls_elite, 0x8C, {"hr_elite_"}},
+        {"elite_effect", L"Elite armor effect", ls_elite, 0x90, {"hr_elitearmoreffect_"}},
+        {"voice", L"Firefight voice", ls_other, 0x94, {"hr_firefightvoice_"}},
+    };
+    static const std::vector<look_slot> h3 = {
+        {"primary", L"Primary color", ls_colors, 0x98, {"h3_color"}, 0x2C},
+        {"secondary", L"Secondary color", ls_colors, 0x9C, {"h3_color"}, 0x30},
+        {"detail", L"Detail color", ls_colors, 0xA0, {"h3_color"}, 0x34},
+        {"helmet", L"Helmet", ls_armor, 0x40, {"h3_helmet_", "h3e_helmet_"}},
+        {"left_shoulder", L"Left shoulder", ls_armor, 0x44, {"h3_leftshoulder_", "h3e_leftshoulder_"}},
+        {"right_shoulder", L"Right shoulder", ls_armor, 0x48, {"h3_rightshoulder_", "h3e_rightshoulder_"}},
+        {"chest", L"Chest", ls_armor, 0x4C, {"h3_chest_", "h3e_chest_"}},
+        {"arms", L"Arms", ls_armor, 0x58, {"h3_arms_", "h3e_arms_"}},
+        {"legs", L"Legs", ls_armor, 0x5C, {"h3_legs_", "h3e_legs_"}},
+        {"backpack", L"Backpack", ls_armor, 0x60, {"h3_backpack_", "h3e_backpack_"}},
+        {"body", L"Body suit", ls_armor, 0x64, {"h3e_techsuit_"}},
+        {"visor", L"Visor color", ls_armor, 0x70, {"h3_visor_"}},
+        {"elite_helmet", L"Elite helmet", ls_elite, 0x74, {"h3e_elitehelmet_"}},
+        {"elite_left_shoulder", L"Elite left shoulder", ls_elite, 0x78, {"h3e_eliteleftshoulder_"}},
+        {"elite_right_shoulder", L"Elite right shoulder", ls_elite, 0x7C, {"h3e_eliterightshoulder_"}},
+        {"elite_chest", L"Elite chest", ls_elite, 0x80, {"h3e_elitechest_"}},
+        {"elite_arms", L"Elite arms", ls_elite, 0x84, {"h3e_elitearms_"}},
+        {"elite_legs", L"Elite legs", ls_elite, 0x88, {"h3e_elitelegs_"}},
+    };
+    static const std::vector<look_slot> h4 = {
+        {"primary", L"Primary color", ls_colors, 0x98, {"h4_color"}, 0x2C},
+        {"secondary", L"Secondary color", ls_colors, 0x9C, {"h4_color"}, 0x30},
+        {"helmet", L"Helmet", ls_armor, 0x40, {"h4_helmet_"}},
+        {"left_shoulder", L"Left shoulder", ls_armor, 0x44, {"h4_leftshoulder_"}},
+        {"right_shoulder", L"Right shoulder", ls_armor, 0x48, {"h4_rightshoulder_"}},
+        {"chest", L"Chest", ls_armor, 0x4C, {"h4_chest_"}},
+        {"arms", L"Arms", ls_armor, 0x58, {"h4_arms_"}},
+        {"legs", L"Legs", ls_armor, 0x5C, {"h4_legs_"}},
+        {"visor", L"Visor color", ls_armor, 0x70, {"h4_visor_"}},
+        {"effect", L"Armor effect", ls_armor, 0x68, {"h4_armoreffect_"}},
+        {"body", L"Gender", ls_armor, 0x64, {"h4_male", "h4_female"}},
+    };
+    static const std::vector<look_slot> h1 = {
+        {"primary", L"Color", ls_colors, 0x98, {"h1_color_"}, 0x2C},
+    };
+    static const std::vector<look_slot> h2 = {
+        {"primary", L"Primary color", ls_colors, 0x98, {"h2_color_"}, 0x2C},
+        {"secondary", L"Secondary color", ls_colors, 0x9C, {"h2_color_"}, 0x30},
+        {"detail", L"Detail color", ls_colors, 0xA0, {"h2_color_"}, 0x34},
+    };
+    static const std::vector<look_slot> odst = {
+        {"primary", L"Primary color", ls_colors, 0x98, {"odst_color_"}, 0x2C},
+        {"secondary", L"Secondary color", ls_colors, 0x9C, {"odst_color_"}, 0x30},
+    };
+    static const std::vector<look_slot> none;
+    switch (module)
+    {
+    case 0: return h1;
+    case 1: return h2;
+    case 2: return h3;
+    case 3: return h4;
+    case 5: return odst;
+    case 6: return reach;
+    }
+    return none;
+}
+// Spartan or Elite in multiplayer (profile 0x38): Halo 2, Halo 3 and Reach.
+static bool look_has_species(int module) { return module == 1 || module == 2 || module == 6; }
+
+static bool starts_with_nocase(const char *s, const char *prefix)
+{
+    for (; *prefix; s++, prefix++)
+        if (tolower((unsigned char)*s) != *prefix) return false;
+    return true;
+}
+// The items a slot offers, in MCC's order.
+static std::vector<const look_item *> look_choices(const look_slot &slot)
+{
+    std::vector<const look_item *> out;
+    for (const auto &it : k_look_items)
+        for (const char *f : slot.families)
+            if (starts_with_nocase(it.name, f)) { out.push_back(&it); break; }
+    return out;
+}
+
+// "HR_Helmet_MarkVB_Base" -> "Mark VB": without the game and the piece, split into words.
+static std::wstring look_name(const char *id)
+{
+    std::string s = id;
+    size_t a = s.find('_'), b = a == std::string::npos ? std::string::npos : s.find('_', a + 1);
+    std::string rest = b != std::string::npos ? s.substr(b + 1) : a != std::string::npos ? s.substr(a + 1) : s;
+    std::vector<std::string> words;
+    std::string w;
+    for (size_t i = 0; i < rest.size(); i++)
+    {
+        char c = rest[i];
+        if (c == '_') { if (!w.empty()) words.push_back(w), w.clear(); continue; }
+        if (!w.empty())
+        {
+            char p = w.back();
+            bool next_lower = i + 1 < rest.size() && islower((unsigned char)rest[i + 1]);
+            if ((islower((unsigned char)p) && isupper((unsigned char)c)) ||
+                (isupper((unsigned char)p) && isupper((unsigned char)c) && next_lower && w.size() > 1))
+                words.push_back(w), w.clear();
+        }
+        w += c;
+    }
+    if (!w.empty()) words.push_back(w);
+    std::string out;
+    for (size_t i = 0; i < words.size(); i++)
+    {
+        std::string x = words[i];
+        bool lower_any = false, upper_any = false;
+        for (char c : x) lower_any |= islower((unsigned char)c) != 0, upper_any |= isupper((unsigned char)c) != 0;
+        // Kept in capitals: codes ("CQB", "UAHUL", "XV27", "SWFT") and a few known abbreviations.
+        static const char *k_caps[] = {"EVA", "EOD", "ODST", "CIO", "SPI", "EVAC", "VI", "VB", "CQC", "GRD", "JFO", "UNSC", "AA", "HUL", "CNM", "CNMI", "MKVI"};
+        bool vowel = false, digit = false, known = false;
+        for (char c : x) vowel |= strchr("AEIOUaeiou", c) != nullptr, digit |= isdigit((unsigned char)c) != 0;
+        for (const char *k : k_caps) known |= x == k;
+        bool code = known || digit || (x.size() <= 4 && !vowel) || x.rfind("UA", 0) == 0 || x.rfind("CBRN", 0) == 0 ||
+                    x.rfind("FC", 0) == 0;
+        if ((upper_any && !lower_any && !code) || (lower_any && !upper_any))
+        {
+            for (auto &c : x) c = (char)tolower((unsigned char)c);
+            x[0] = (char)toupper((unsigned char)x[0]);
+        }
+        if (_stricmp(x.c_str(), "Base") == 0 && words.size() > 1) continue;
+        out += (out.empty() ? "" : " ") + x;
+    }
+    bool digits = !out.empty();
+    for (char c : out) digits &= isdigit((unsigned char)c) != 0;
+    if (digits) out = "Color " + out;
+    std::wstring wide;
+    for (char c : out) wide += (wchar_t)(unsigned char)c;
+    return wide;
+}
+
+static std::string look_key(const std::string &game, const char *slot) { return game + "_" + slot; }
+
+// Halo 4's loadouts: what each number is, read off the game's own loadout screen. Both weapons share one list, and the tactical
+// package and support upgrade share another. Numbers the game shows no name for
+// (campaign-only items) are left out.
+struct loadout_item { int index; const wchar_t *name; };
+struct loadout_field { const char *key; const wchar_t *label; int offset; std::vector<loadout_item> items; };
+static const std::vector<loadout_field> &loadout_fields()
+{
+    static const std::vector<loadout_item> weapons = {
+        {1, L"Assault Rifle"}, {43, L"Battle Rifle"}, {0, L"DMR"}, {30, L"Storm Rifle"}, {34, L"Covenant Carbine"},
+        {24, L"Light Rifle"}, {44, L"Suppressor"}, {5, L"Magnum"}, {2, L"Plasma Pistol"}, {39, L"Boltshot"},
+        {6, L"Needler"}, {9, L"Shotgun"}, {25, L"Scattershot"}, {37, L"SAW"}, {10, L"Sniper Rifle"}, {35, L"Beam Rifle"},
+        {26, L"Binary Rifle"}, {28, L"Railgun"}, {36, L"Sticky Detonator"}, {41, L"Concussion Rifle"},
+        {42, L"Fuel Rod Cannon"}, {8, L"Rocket Launcher"}, {11, L"Spartan Laser"}, {4, L"Energy Sword"},
+        {12, L"Gravity Hammer"}};
+    static const std::vector<loadout_item> perks = {
+        {1, L"Mobility"}, {6, L"Shielding"}, {8, L"Resupply"}, {2, L"Grenadier"}, {7, L"AA Efficiency"}, {9, L"Firepower"},
+        {16, L"Wheelman"}, {19, L"Fast Track"}, {18, L"Requisition"}, {11, L"Ammo"}, {3, L"Dexterity"}, {0, L"Sensor"},
+        {5, L"Awareness"}, {20, L"Explosives"}, {4, L"Ordnance Priority"}, {13, L"Stability"}, {15, L"Drop Recon"},
+        {14, L"Nemesis"}, {17, L"Gunner"}, {12, L"Stealth"}, {23, L"Survivor"}, {24, L"Recharge"}, {25, L"Resistor"}};
+    static const std::vector<loadout_field> f = {
+        {"primary", L"Primary weapon", 0x08, weapons},
+        {"secondary", L"Secondary weapon", 0x0C, weapons},
+        {"grenade", L"Grenade", 0x1C, {{0, L"Frag Grenade"}, {1, L"Plasma Grenade"}, {2, L"Pulse Grenade"}}},
+        {"ability", L"Armor ability", 0x18,
+         {{17, L"Promethean Vision"}, {7, L"Hologram"}, {18, L"Thruster Pack"}, {4, L"Active Camo"}, {12, L"Hardlight Shield"},
+          {1, L"Jet Pack"}, {20, L"Regeneration Field"}, {14, L"Autosentry"}}},
+        {"tactical", L"Tactical package", 0x00, perks},
+        {"support", L"Support upgrade", 0x04, perks},
+    };
+    return f;
+}
+static int loadout_position(const loadout_field &f, int v)
+{
+    for (size_t i = 0; i < f.items.size(); i++)
+        if (f.items[i].index == v) return (int)i;
+    return -1;
+}
+static std::wstring loadout_value_name(const loadout_field &f, int v)
+{
+    int at = loadout_position(f, v);
+    return at >= 0 ? f.items[at].name : L"Item " + std::to_wstring(v);
+}
+
+// Into the profile, before a game starts (and when changed from its pause menu).
+static void apply_look(const std::string &game, int module)
+{
+    unsigned char *p = g_player_profile;
+    put<int32_t>(p, 0x2C, 0);
+    put<int32_t>(p, 0x30, 0);
+    put<int32_t>(p, 0x34, 0);
+    p[0x38] = 0;
+    memset(p + 0x40, 0, 0x16C); // armor, colors, poses, skins
+    memset(p + 0x1AC, 0, 8);    // service tag
+    int set = 0;
+    for (const auto &slot : look_slots(module))
+    {
+        auto it = g_settings.look.find(look_key(game, slot.key));
+        if (it == g_settings.look.end() || it->second.empty()) continue;
+        auto choices = look_choices(slot);
+        for (size_t i = 0; i < choices.size(); i++)
+            if (_stricmp(choices[i]->name, it->second.c_str()) == 0)
+            {
+                put<int32_t>(p, slot.offset, choices[i]->id);
+                if (slot.index_offset >= 0) put<int32_t>(p, slot.index_offset, (int32_t)i);
+                set++;
+            }
+    }
+    if (look_has_species(module))
+    {
+        auto it = g_settings.look.find(look_key(game, "species"));
+        p[0x38] = it != g_settings.look.end() && it->second == "elite" ? 1 : 0;
+    }
+    std::wstring tag;
+    for (char c : g_settings.service_tag)
+        if (isalnum((unsigned char)c) && tag.size() < 4) tag += (wchar_t)toupper((unsigned char)c);
+    memcpy(p + 0x1AC, tag.c_str(), tag.size() * sizeof(wchar_t));
+    // Halo 4's five loadouts: 0x3C each from 0x1E4, their names at +0x20.
+    memset(p + 0x1E4, 0, 5 * 0x3C);
+    if (module == 3)
+        for (int n = 0; n < 5; n++)
+        {
+            unsigned char *l = p + 0x1E4 + n * 0x3C;
+            const auto &fields = loadout_fields();
+            for (size_t i = 0; i < fields.size(); i++) put<int32_t>(l, fields[i].offset, g_settings.loadout[n][i]);
+            std::wstring name = L"Loadout " + std::to_wstring(n + 1);
+            memcpy(l + 0x20, name.c_str(), (name.size() + 1) * sizeof(wchar_t));
+        }
+    g_profile_changed = true;
+    logf("look: %d pieces set for %s%s%s", set, game.c_str(), tag.empty() ? "" : ", service tag ",
+         tag.empty() ? "" : narrow(tag.c_str()).c_str());
+}
+
+// ------------------------------------------------ settings changed inside a game
+// Look inversion changed in a game's own menu (host #14), and each game's own block of
+// profile settings (host #15, 256 bytes; MCC keeps one per game and player). Both are
+// kept: the block in profiles\<game>.bin, restored into the profile at 0x310.
+static std::atomic<bool> g_look_inverted_changed, g_game_data_changed;
+static std::mutex g_game_data_lock;
+static unsigned char g_game_data[0x100];
+
+static std::wstring game_data_path(const std::wstring &game) { return g_cfg.host_dir + L"\\profiles\\" + game + L".bin"; }
+
+static void load_game_data(const std::wstring &game)
+{
+    std::lock_guard<std::mutex> l(g_game_data_lock);
+    memset(g_game_data, 0, sizeof g_game_data);
+    bool got = false;
+    if (FILE *f = _wfopen(game_data_path(game).c_str(), L"rb"))
+    {
+        got = fread(g_game_data, 1, sizeof g_game_data, f) == sizeof g_game_data;
+        fclose(f);
+    }
+    if (!got) memset(g_game_data, 0, sizeof g_game_data);
+    memcpy(g_player_profile + 0x310, g_game_data, sizeof g_game_data);
+    logf("game settings block for %s: %s", narrow(game.c_str()).c_str(), got ? "restored" : "none kept yet");
+}
+
+static void h_set_player_look_control(void *, int player, bool inverted)
+{
+    LOG_CALL(14, "host.set_player_look_control player %d inverted %d", player, inverted ? 1 : 0);
+    if (player != 0) return;
+    g_player_profile[0x1D] = inverted ? 1 : 0;
+    if (g_settings.invert_look != (inverted ? 1 : 0))
+    {
+        g_settings.invert_look = inverted ? 1 : 0;
+        g_look_inverted_changed = true;
+    }
+}
+
+static void h_set_player_profile_game_specific(void *, int player, const unsigned char *data)
+{
+    LOG_CALL(15, "host.set_player_profile_game_specific player %d", player);
+    if (player != 0 || !data) return;
+    std::lock_guard<std::mutex> l(g_game_data_lock);
+    if (memcmp(g_game_data, data, sizeof g_game_data) == 0) return;
+    memcpy(g_game_data, data, sizeof g_game_data);
+    memcpy(g_player_profile + 0x310, data, sizeof g_game_data);
+    g_game_data_changed = true;
+}
+
+// On the main thread, while a game runs and after it: write down what changed.
+static void keep_game_changes()
+{
+    if (g_look_inverted_changed.exchange(false))
+    {
+        save_settings();
+        logf("look inversion changed in the game: %d, kept", g_settings.invert_look);
+    }
+    if (g_game_data_changed.exchange(false))
+    {
+        unsigned char copy[0x100];
+        {
+            std::lock_guard<std::mutex> l(g_game_data_lock);
+            memcpy(copy, g_game_data, sizeof copy);
+        }
+        CreateDirectoryW((g_cfg.host_dir + L"\\profiles").c_str(), nullptr);
+        std::wstring path = game_data_path(g_cfg.game), temp = path + L".new";
+        bool ok = false;
+        if (FILE *f = _wfopen(temp.c_str(), L"wb"))
+        {
+            ok = fwrite(copy, 1, sizeof copy, f) == sizeof copy;
+            ok = (fclose(f) == 0) && ok;
+        }
+        if (ok) ok = MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        logf("game settings block changed in the game: %s", ok ? "kept" : "could not write it");
+    }
 }
 
 // ------------------------------------------------ games and missions
@@ -2148,6 +3808,134 @@ static const mission_entry *current_mission()
     return nullptr;
 }
 
+// ------------------------------------------------ Forge maps (map variants)
+// Saved in map_variants\<game>\<map file>\<name>.mvar next to the exe. To save, the
+// host posts message 11; the game answers with its current map variant through host
+// #12 (Reach: haloreach.dll+0xf9a7, Halo 3: halo3.dll+0xb97f), whose file bytes it
+// gives with save_to_file. The variant then belongs to the host, which frees it.
+static std::wstring map_variant_dir(const std::wstring &game, const std::string &map_file)
+{
+    std::wstring file(map_file.begin(), map_file.end());
+    return g_cfg.host_dir + L"\\map_variants\\" + game + L"\\" + file;
+}
+static std::vector<std::wstring> saved_map_variants(const std::wstring &game, const std::string &map_file)
+{
+    std::vector<std::wstring> out;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((map_variant_dir(game, map_file) + L"\\*.mvar").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring n = fd.cFileName;
+        out.push_back(n.substr(0, n.size() - 5));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::wstring &a, const std::wstring &b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    return out;
+}
+static std::wstring file_safe(std::wstring s)
+{
+    for (auto &c : s)
+        if (c < 32 || wcschr(L"\\/:*?\"<>|", c)) c = L'_';
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'.')) s.pop_back();
+    while (!s.empty() && s[0] == L' ') s.erase(0, 1);
+    return s.size() > 60 ? s.substr(0, 60) : s;
+}
+
+static std::mutex g_forge_lock;
+static std::wstring g_map_variant_path; // the saved map this game started with (or last saved to)
+static std::wstring g_forge_status;     // for the pause menu
+static std::atomic<int> g_forge_save{0}; // asked for: 1 save (over the loaded map), 2 save as a new map
+static std::atomic<int64_t> g_forge_asked_at;
+
+static void h_set_scenario_map_variant(void *, i_scenario_map_variant *variant)
+{
+    int want = g_forge_save.exchange(0);
+    LOG_CALL(12, "host.set_scenario_map_variant %p%s", (void *)variant, want ? " (asked to save)" : "");
+    if (!variant) return;
+    if (want)
+    {
+        const char *buf = nullptr;
+        uint32_t len = 0;
+        bool ok = variant->save_to_file(&buf, &len) && buf && len;
+        const wchar_t *vn = variant->get_name();
+        std::wstring name = file_safe(vn ? std::wstring(vn, wcsnlen(vn, 64)) : L"");
+        if (name.empty())
+        {
+            const mission_entry *m = current_mission();
+            name = m ? m->name : L"Map";
+        }
+        std::wstring dir = map_variant_dir(g_cfg.game, narrow(g_cfg.map_file.c_str())), path;
+        {
+            std::lock_guard<std::mutex> l(g_forge_lock);
+            path = want == 1 ? g_map_variant_path : L"";
+        }
+        if (path.empty())
+        {
+            for (int n = 1; n < 1000; n++)
+            {
+                std::wstring p = dir + L"\\" + name + (n > 1 ? L" " + std::to_wstring(n) : L"") + L".mvar";
+                if (GetFileAttributesW(p.c_str()) == INVALID_FILE_ATTRIBUTES) { path = p; break; }
+            }
+        }
+        if (ok && !path.empty())
+        {
+            CreateDirectoryW((g_cfg.host_dir + L"\\map_variants").c_str(), nullptr);
+            CreateDirectoryW((g_cfg.host_dir + L"\\map_variants\\" + g_cfg.game).c_str(), nullptr);
+            CreateDirectoryW(dir.c_str(), nullptr);
+            std::wstring temp = path + L".new";
+            ok = false;
+            if (FILE *f = _wfopen(temp.c_str(), L"wb"))
+            {
+                ok = fwrite(buf, 1, len, f) == len;
+                ok = (fclose(f) == 0) && ok;
+            }
+            if (ok) ok = MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+            else DeleteFileW(temp.c_str());
+        }
+        std::wstring shown = path.substr(path.find_last_of(L'\\') + 1);
+        if (shown.size() > 5) shown.resize(shown.size() - 5);
+        {
+            std::lock_guard<std::mutex> l(g_forge_lock);
+            if (ok) g_map_variant_path = path;
+            g_forge_status = ok ? L"Saved as “" + shown + L"”" : L"Could not save the map";
+        }
+        logf("forge: map variant \"%s\" (%u bytes) %s %s", narrow(name.c_str()).c_str(), len, ok ? "saved to" : "NOT saved,",
+             narrow(path.c_str()).c_str());
+    }
+    variant->free_();
+}
+
+// Pause menu: ask the game for its map (it answers on its own thread).
+static void request_forge_save(bool as_new)
+{
+    {
+        std::lock_guard<std::mutex> l(g_forge_lock);
+        g_forge_status = L"Saving…";
+    }
+    g_forge_save = as_new ? 2 : 1;
+    g_forge_asked_at = (int64_t)GetTickCount64();
+    if (g_engine) g_engine->post_message(11, nullptr);
+    logf("forge: asked the game for its map variant (%s)", as_new ? "new map" : "save");
+}
+static std::wstring forge_status()
+{
+    std::lock_guard<std::mutex> l(g_forge_lock);
+    if (g_forge_save && (int64_t)GetTickCount64() - g_forge_asked_at > 5000)
+    {
+        g_forge_save = 0;
+        g_forge_status = L"The game didn't hand over the map";
+    }
+    return g_forge_status;
+}
+static std::wstring loaded_map_variant_name()
+{
+    std::lock_guard<std::mutex> l(g_forge_lock);
+    std::wstring s = g_map_variant_path.substr(g_map_variant_path.find_last_of(L'\\') + 1);
+    return s.size() > 5 ? s.substr(0, s.size() - 5) : L"";
+}
+
 // What to do when the current game (or the launcher) ends.
 struct next_action
 {
@@ -2160,6 +3948,9 @@ struct next_action
     int mode = 1;        // 1 campaign, 2 Spartan Ops, 3 custom game, 5 Firefight
     int players = 1;     // local players (campaign split-screen)
     std::string variant; // Firefight / Spartan Ops: the game type's file, relative to the game's folder (no .bin)
+    std::wstring map_variant; // custom games and Forge: a saved map's file (empty: the map as it comes)
+    int classic = -1;         // LAN campaign: the host's graphics choice (-1: this machine's setting)
+    bool coop = false;        // with resume: continue the co-op saved game (with the machines that joined)
 };
 static next_action g_next;
 static int g_mode = 1;           // what's running: 1 campaign, 2 Spartan Ops, 5 Firefight
@@ -2188,14 +3979,446 @@ static void relaunch(const std::wstring &game, int map, const std::string &file,
 }
 
 static void relaunch_mode(int mode, const std::wstring &game, int map, const std::string &file, const std::string &variant,
-                          int difficulty)
+                          int difficulty, const std::wstring &map_variant = L"")
 {
     relaunch(game, map, file, difficulty);
     next_action n = g_next;
-    n.mode = mode, n.variant = variant;
+    n.mode = mode, n.variant = variant, n.map_variant = map_variant;
     g_next = n;
-    logf("next: mode %d, game type %s", mode, variant.c_str());
+    logf("next: mode %d, game type %s%s%s", mode, variant.c_str(), map_variant.empty() ? "" : ", map variant ",
+         narrow(map_variant.c_str()).c_str());
 }
+
+// ---------------------------------------------------------------- LAN play: starting games
+namespace lan
+{
+static std::wstring widen(const std::string &s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n ? n - 1 : 0, L'\0');
+    if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    return w;
+}
+
+// Co-op continue, on the host: get the saved game to every machine that joined. First
+// an offer with each piece's hash (a client keeps the pieces its own co-op save already
+// has), then the missing pieces in batches, each followed by "which pieces have you
+// got?". The sending is paced, and slows down when pieces go missing: a PS5 on a wired
+// network can send far faster than a handheld on Wi-Fi can take, and a flood also
+// drowns the small messages that keep the lobby alive. Gives up (false) when nothing
+// arrives for 15 seconds, or after 2 minutes.
+static void pump_while_waiting()
+{
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) TranslateMessage(&msg), DispatchMessageW(&msg);
+}
+static bool send_save(const std::vector<peer> &peers, const std::string &data, uint32_t game_id, const std::wstring &game)
+{
+    uint32_t pieces = (uint32_t)((data.size() + k_piece - 1) / k_piece);
+    std::vector<std::vector<bool>> need(peers.size(), std::vector<bool>(pieces, true));
+    static std::vector<char> buf(sizeof(save_piece) + k_piece);
+    static save_offer offer;
+    memset(&offer, 0, sizeof(offer));
+    offer.game_id = game_id;
+    offer.total = (uint32_t)data.size();
+    offer.pieces = pieces;
+    put(offer.game, sizeof(offer.game), std::string(game.begin(), game.end()));
+    for (uint32_t i = 0; i < pieces; i++)
+    {
+        uint32_t at = i * k_piece;
+        offer.hash[i] = fnv64(data.data() + at, std::min<uint32_t>(k_piece, (uint32_t)data.size() - at));
+    }
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        g_save_reports.clear();
+    }
+    const size_t offer_size = offsetof(save_offer, hash) + pieces * sizeof(uint64_t);
+    const uint32_t k_batch = 48;      // pieces between questions: about 1.5 MB
+    double rate = 4e6;                // bytes a second; between 0.5 and 16 MB/s
+    int64_t start = ms(), progress_at = start;
+    size_t best = SIZE_MAX, sent_total = 0, last_batch = 0, last_missing = 0;
+    for (int round = 1;; round++)
+    {
+        // Ask which pieces each machine has (the first time, offer the hashes too).
+        std::vector<uint32_t> before(peers.size(), 0);
+        auto answers = [&](size_t p) -> uint32_t {
+            for (const auto &x : g_save_reports)
+                if (x.id == peers[p].id && x.game_id == game_id) return x.answers;
+            return 0;
+        };
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            for (size_t p = 0; p < peers.size(); p++) before[p] = answers(p);
+        }
+        for (int ask = 0; ask < 8; ask++)
+        {
+            for (size_t p = 0; p < peers.size(); p++)
+            {
+                if (round == 1 || answers(p) == 0) raw_send(peers[p].addr, t_save_offer, &offer, offer_size);
+                raw_send(peers[p].addr, t_save_query, &game_id, 4);
+            }
+            bool all = false;
+            for (int w = 0; w < 10 && !all; w++)
+            {
+                Sleep(15);
+                pump_while_waiting();
+                std::lock_guard<std::mutex> l(g_lock);
+                all = true;
+                for (size_t p = 0; p < peers.size(); p++)
+                    if (answers(p) == before[p]) all = false;
+            }
+            if (all) break;
+        }
+        size_t missing = 0;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            for (size_t p = 0; p < peers.size(); p++)
+            {
+                const save_report *r = nullptr;
+                for (const auto &x : g_save_reports)
+                    if (x.id == peers[p].id && x.game_id == game_id) r = &x;
+                for (uint32_t i = 0; i < pieces; i++)
+                {
+                    if (r && (r->have[i / 8] >> (i % 8) & 1)) need[p][i] = false;
+                    missing += need[p][i];
+                }
+            }
+        }
+        if (!missing)
+        {
+            logf("lan: sent the co-op saved game (%zu bytes, %zu sent) to %zu machine(s) in %lld ms, %d round(s)", data.size(),
+                 sent_total, peers.size(), (long long)(ms() - start), round);
+            return true;
+        }
+        if (round == 1)
+            logf("lan: sending the co-op saved game: %zu of %u piece(s) needed", missing, pieces * (unsigned)peers.size());
+        int64_t now = ms();
+        if (missing < best) best = missing, progress_at = now;
+        if (now - progress_at > 15000 || now - start > 120000)
+        {
+            logf("lan: sending the co-op saved game: %zu piece(s) still missing after %d round(s)", missing, round);
+            return false;
+        }
+        // Did the last batch get through? Go faster if so, slower if not.
+        if (round > 2 && last_batch)
+        {
+            size_t arrived = last_missing > missing ? last_missing - missing : 0;
+            if (arrived * 10 >= last_batch * 9) rate = std::min(rate * 1.5, 16e6);
+            else rate = std::max(rate / 2, 0.5e6);
+        }
+        // The next batch, paced.
+        size_t batch = 0;
+        int64_t t0 = ms();
+        size_t bytes = 0;
+        for (size_t p = 0; p < peers.size(); p++)
+            for (uint32_t i = 0; i < pieces && batch < k_batch; i++)
+            {
+                if (!need[p][i]) continue;
+                save_piece sp = {game_id, (uint32_t)data.size(), i, pieces};
+                uint32_t at = i * k_piece, size = std::min<uint32_t>(k_piece, (uint32_t)data.size() - at);
+                memcpy(buf.data(), &sp, sizeof(sp));
+                memcpy(buf.data() + sizeof(sp), data.data() + at, size);
+                raw_send(peers[p].addr, t_save, buf.data(), sizeof(sp) + size);
+                batch++;
+                bytes += size;
+                int64_t due = t0 + (int64_t)(bytes * 1000.0 / rate);
+                while (ms() < due) { Sleep(1); pump_while_waiting(); }
+            }
+        sent_total += bytes;
+        last_batch = batch;
+        last_missing = missing;
+        if (round % 10 == 0)
+            logf("lan: sending the co-op saved game, round %d: %zu piece(s) still missing, %.1f MB/s", round, missing, rate / 1e6);
+    }
+}
+
+// The host, as a Halo CE custom game starts: if machines have joined, make the
+// player list (this machine first) and send it, with what to play and the game type's
+// file, to each of them.
+static void host_game_starting(const next_action &what)
+{
+    if (g_role != k_host) return; // a client's list came from the host (poll)
+    g_seats.clear();
+    g_my_xuid = 0x0009000000000001ull;
+    if (what.mode != 1 && what.mode != 2 && what.mode != 3 && what.mode != 5)
+    {
+        logf("lan: mode %d isn't played over LAN; playing alone", what.mode);
+        return;
+    }
+    g_resume_data.clear();
+    if (what.resume && !what.coop)
+    {
+        logf("lan: continuing the solo saved game is played alone");
+        return;
+    }
+    std::vector<peer> peers;
+    {
+        std::lock_guard<std::mutex> l(g_lock);
+        for (const auto &p : g_peers)
+            if (std::find(g_left_out.begin(), g_left_out.end(), p.id) == g_left_out.end()) peers.push_back(p);
+            else logf("lan: %s can't play this and is left out", p.name.c_str());
+    }
+    g_left_out.clear();
+    if (peers.empty()) { logf("lan: nobody who joined can play this; playing alone"); return; }
+    g_seats.push_back({g_my_xuid, g_my_id});
+    size_t most = what.mode == 1 || what.mode == 2 ? 4 : 16; // campaign and Spartan Ops: 4 players
+    if (peers.size() + 1 > most) logf("lan: co-op takes 4 players; the first %zu who joined play", most - 1);
+    for (size_t i = 0; i < peers.size() && g_seats.size() < most; i++)
+        g_seats.push_back({0x0009000000000001ull + 0x10 * (i + 1), peers[i].id});
+    static start_msg m; // big: not on the stack
+    memset(&m, 0, sizeof(m));
+    strncpy(m.game, narrow(what.game.c_str()).c_str(), sizeof(m.game) - 1);
+    m.map = what.map;
+    strncpy(m.file, what.file.c_str(), sizeof(m.file) - 1);
+    m.mode = what.mode;
+    m.difficulty = what.difficulty;
+    {
+        const game_entry *ge = find_game(what.game);
+        m.classic = !ge ? -1 : ge->module == 0 ? g_settings.h1_classic : ge->module == 1 ? g_settings.h2_classic : -1;
+    }
+    // The game type: its name for the others, and its file so they play the same one.
+    std::string variant = what.variant;
+    size_t slash = variant.find_last_of("\\/");
+    strncpy(m.variant, variant.substr(slash == std::string::npos ? 0 : slash + 1).c_str(), sizeof(m.variant) - 1);
+    std::wstring wv = widen(variant);
+    std::wstring path = (wv.size() > 2 && wv[1] == L':' ? wv : g_cfg.mcc_root + L"\\" + what.game + L"\\" + wv) + L".bin";
+    if (FILE *f = _wfopen(path.c_str(), L"rb"))
+    {
+        m.variant_size = (uint32_t)fread(m.variant_data, 1, sizeof(m.variant_data), f);
+        if (fgetc(f) != EOF) m.variant_size = 0; // too big to send; the others use their own copy
+        fclose(f);
+    }
+    m.count = (uint32_t)g_seats.size();
+    for (size_t i = 0; i < g_seats.size(); i++) m.seats[i] = g_seats[i];
+    static uint32_t next_id = GetTickCount() | 1;
+    m.game_id = next_id++;
+    // Co-op continue: everyone starts from the host's last co-op checkpoint, so it goes
+    // to each of them first. If that fails, everyone starts the mission instead.
+    if (what.resume && what.coop)
+    {
+        std::string bytes = read_file(coop_save_path(what.game));
+        if (bytes.size() < 4096 || bytes.size() > (size_t)k_piece * k_most_pieces)
+            logf("lan: the co-op saved game could not be read; starting the mission");
+        else if (!g_settings.coop_continue_all)
+        {
+            // Only the host loads it; the others join the way they join any game (the
+            // game itself may hand them the state, as Halo 3 did for players joining a
+            // co-op game in progress).
+            g_resume_data.assign(bytes.begin(), bytes.end());
+            logf("lan: continuing the co-op saved game here; the other machines join it");
+        }
+        else if (!send_save(peers, bytes, m.game_id, what.game))
+            logf("lan: the co-op saved game didn't reach everyone; starting the mission");
+        else
+        {
+            g_resume_data.assign(bytes.begin(), bytes.end());
+            m.save_size = (uint32_t)bytes.size();
+            m.save_hash = fnv64(bytes.data(), bytes.size());
+        }
+    }
+    // A saved Forge map goes first, in a message of its own.
+    if (!what.map_variant.empty())
+    {
+        static map_msg map;
+        memset(&map, 0, offsetof(map_msg, data));
+        map.game_id = m.game_id;
+        if (FILE *f = _wfopen(what.map_variant.c_str(), L"rb"))
+        {
+            map.size = (uint32_t)fread(map.data, 1, sizeof(map.data), f);
+            if (fgetc(f) != EOF) map.size = 0; // too big to send
+            fclose(f);
+        }
+        if (map.size)
+        {
+            std::wstring name = what.map_variant.substr(what.map_variant.find_last_of(L'\\') + 1);
+            if (name.size() > 5) name.resize(name.size() - 5);
+            put(m.map_name, sizeof(m.map_name), narrow(name.c_str()));
+            m.map_size = map.size;
+            for (int round = 0; round < 3; round++)
+            {
+                for (const auto &p : peers) raw_send(p.addr, t_map, &map, offsetof(map_msg, data) + map.size);
+                Sleep(20);
+            }
+            logf("lan: sent the saved map %s (%u bytes)", m.map_name, map.size);
+        }
+        else logf("lan: the saved map could not be read to send; the others play the map as it comes");
+    }
+    for (int round = 0; round < 3; round++)
+    {
+        for (const auto &p : peers) raw_send(p.addr, t_start, &m, k_start_head + m.variant_size);
+        Sleep(20);
+    }
+    logf("lan: told %zu machine(s) to start %s, map %d (%s), game type %s (%u bytes)", peers.size(), m.game, m.map, m.file,
+         m.variant, m.variant_size);
+}
+
+// After a game, on both sides: the host tells the others it's over.
+static void game_ended()
+{
+    if (g_role == k_host && !g_seats.empty())
+    {
+        std::vector<peer> peers;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            peers = g_peers;
+        }
+        for (int round = 0; round < 3; round++)
+            for (const auto &p : peers) raw_send(p.addr, t_end, nullptr, 0);
+    }
+    g_seats.clear();
+    g_my_xuid = 0x0009000000000001ull;
+    g_end_ready = false;
+}
+
+// On the main thread: a client starts the host's game, or leaves it when the host ends it.
+static void poll(bool in_game)
+{
+    if (in_game)
+    {
+        // (the host may also have gone away: then this machine isn't a client any more)
+        if (!g_seats.empty() && g_role != k_host && g_end_ready.exchange(false) && g_next.kind == next_action::k_none)
+        {
+            logf("lan: the host ended the game");
+            g_next.kind = next_action::k_launcher;
+        }
+        return;
+    }
+    if (g_role != k_client || !g_start_ready) { g_start_waiting = 0; return; }
+    static start_msg m;
+    static map_msg map;
+    {
+        std::lock_guard<std::mutex> l(g_start_lock);
+        memcpy(&m, &g_start, k_start_head + std::min<uint32_t>(g_start.variant_size, sizeof(m.variant_data)));
+        // A saved Forge map comes just before the start; give it a moment if it's late.
+        map.size = 0;
+        if (m.map_size && g_map_in.game_id == m.game_id && g_map_in.size == m.map_size)
+            memcpy(&map, &g_map_in, offsetof(map_msg, data) + g_map_in.size);
+    }
+    if (m.map_size && !map.size)
+    {
+        if (!g_start_waiting) g_start_waiting = ms();
+        if (ms() - g_start_waiting < 3000) return;
+        logf("lan: the host's saved map didn't arrive; playing the map as it comes");
+    }
+    // Co-op continue: the host's saved game arrived before the start (the host checked).
+    g_resume_data.clear();
+    if (m.save_size)
+    {
+        std::lock_guard<std::mutex> l(g_start_lock);
+        if (g_save_own_id == m.game_id && !g_save_own.empty())
+            g_resume_data.swap(g_save_own);
+        else if (g_save_in_id == m.game_id && g_save_in.size() == m.save_size && fnv64(g_save_in.data(), g_save_in.size()) == m.save_hash)
+            g_resume_data.swap(g_save_in);
+        g_save_own.clear();
+        g_save_own_id = 0;
+        g_save_in.clear();
+        g_save_in_have.clear();
+    }
+    if (m.save_size && g_resume_data.empty())
+    {
+        g_start_ready = false;
+        logf("lan: the host's co-op saved game didn't arrive complete; not starting");
+        std::lock_guard<std::mutex> l(g_lock);
+        g_left_reason = "The host's saved game didn't arrive; ask the host to start again";
+        return;
+    }
+    g_start_waiting = 0;
+    g_start_ready = false;
+    g_end_ready = false;
+    m.game[sizeof(m.game) - 1] = m.file[sizeof(m.file) - 1] = m.variant[sizeof(m.variant) - 1] = 0;
+    std::wstring game(m.game, m.game + strlen(m.game));
+    const game_entry *g = find_game(game);
+    if (!g || !game_installed(*g))
+    {
+        logf("lan: the host started %s, which isn't installed here", m.game);
+        std::lock_guard<std::mutex> l(g_lock);
+        g_left_reason = "The host started a game that isn't installed here";
+        return;
+    }
+    uint32_t n = std::min<uint32_t>(m.count, 16);
+    g_seats.assign(m.seats, m.seats + n);
+    bool found = false;
+    for (const auto &seat : g_seats)
+        if (seat.address == g_my_id) g_my_xuid = seat.xuid, found = true;
+    if (!found)
+    {
+        logf("lan: the host started a game without this machine in it");
+        g_seats.clear();
+        return;
+    }
+    // The host's game type file, kept in lan_game_types next to the exe.
+    std::string variant = std::string("game_variants\\") + m.variant;
+    if (m.variant_size)
+    {
+        std::wstring dir = g_cfg.host_dir + L"\\lan_game_types";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"\\" + game;
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::string name = m.variant;
+        for (auto &c : name)
+            if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
+        std::wstring path = dir + L"\\" + widen(name) + L".bin";
+        if (FILE *f = _wfopen(path.c_str(), L"wb"))
+        {
+            fwrite(m.variant_data, 1, m.variant_size, f);
+            fclose(f);
+            variant = narrow((dir + L"\\" + widen(name)).c_str());
+        }
+    }
+    // The host's saved Forge map, kept in lan_map_variants next to the exe.
+    std::wstring map_path;
+    if (map.size)
+    {
+        m.map_name[sizeof(m.map_name) - 1] = 0;
+        std::wstring dir = g_cfg.host_dir + L"\\lan_map_variants";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"\\" + game;
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::wstring name = file_safe(widen(m.map_name));
+        std::wstring path = dir + L"\\" + (name.empty() ? L"map" : name) + L".mvar";
+        if (FILE *f = _wfopen(path.c_str(), L"wb"))
+        {
+            bool ok = fwrite(map.data, 1, map.size, f) == map.size;
+            ok = (fclose(f) == 0) && ok;
+            if (ok) map_path = path;
+        }
+        logf("lan: the host's saved map %s (%u bytes)%s", m.map_name, map.size, map_path.empty() ? " could not be written" : "");
+    }
+    next_action a;
+    a.kind = next_action::k_game;
+    a.map_variant = map_path;
+    a.game = game;
+    a.map = m.map;
+    a.file = m.file;
+    a.difficulty = m.difficulty;
+    a.mode = m.mode;
+    a.classic = m.classic;
+    a.variant = variant;
+    a.players = 1;
+    a.resume = a.coop = !g_resume_data.empty();
+    g_next = a;
+    if (a.resume) logf("lan: continuing the host's co-op saved game (%zu bytes)", g_resume_data.size());
+    logf("lan: the host started %s, map %d (%s), game type %s, %u players", m.game, m.map, m.file, variant.c_str(), n);
+}
+
+// For the launcher's header.
+static std::wstring status()
+{
+    if (g_role == k_host)
+    {
+        size_t n;
+        {
+            std::lock_guard<std::mutex> l(g_lock);
+            n = g_peers.size();
+        }
+        return L"  •  Hosting a LAN game: " + std::to_wstring(n) + (n == 1 ? L" player joined" : L" players joined");
+    }
+    if (g_role == k_client)
+        return g_welcomed ? L"  •  In a LAN game" : L"  •  Looking for " + widen(g_join_text) + L"…";
+    if (!g_problem.empty()) return L"  •  LAN: " + widen(g_problem);
+    return L"";
+}
+} // namespace lan
 
 static void request_quit()
 {
@@ -2211,13 +4434,14 @@ struct save_info
     int map = -1, difficulty = 1;
     std::string file, saved;
 };
-static save_info read_save_info(const std::wstring &game)
+static save_info read_save_info(const std::wstring &game, bool coop = false)
 {
     save_info info;
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExW(save_path(game).c_str(), GetFileExInfoStandard, &fa)) return info;
+    std::wstring path = coop ? coop_save_path(game) : save_path(game);
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) return info;
     if (fa.nFileSizeHigh == 0 && fa.nFileSizeLow < 4096) return info; // not a real saved game
-    FILE *f = _wfopen((save_path(game) + L".info").c_str(), L"r");
+    FILE *f = _wfopen((path + L".info").c_str(), L"r");
     if (!f) return info;
     char line[256];
     while (fgets(line, sizeof line, f))
@@ -2274,7 +4498,8 @@ static void quit_without_saving()
 
 namespace menu
 {
-enum page_id { p_main, p_missions, p_settings, p_quit, p_games, p_setup, p_confirm, p_controls, p_pad, p_keys, p_firefight, p_spops, p_custom, p_forge, p_campaign, p_pick };
+enum page_id { p_main, p_missions, p_settings, p_quit, p_games, p_setup, p_confirm, p_controls, p_pad, p_keys, p_firefight, p_spops, p_custom, p_forge, p_campaign, p_pick, p_lan, p_ip, p_joined, p_look, p_loadouts, p_loadout, p_text,
+               p_set_controls, p_set_video, p_set_audio, p_set_access, p_lobby };
 // A yes/no question: its title, a line of detail, and what Yes does.
 static std::wstring g_confirm_title, g_confirm_note;
 static std::function<void()> g_confirm_yes;
@@ -2283,13 +4508,16 @@ struct item
     std::wstring label, value; // value empty: not adjustable
     std::function<void()> activate;
     std::function<void(int)> adjust;
-    std::wstring note;   // small text under the label
+    std::wstring note;   // what it does: shown at the bottom while it's selected
     bool enabled = true;
+    bool heading = false; // a small section title; skipped when moving up and down
+    std::wstring tile;    // main page: a game's tile (its folder); empty for other items
 };
 
 static std::recursive_mutex g_lock;
 static std::atomic<bool> g_open, g_open_request;
 static page_id g_page = p_main;
+static void open_name_entry();
 static int g_selected = 0;
 static int g_difficulty = 1;
 static std::atomic<int64_t> g_last_game_frame;
@@ -2300,7 +4528,14 @@ static int g_pick_mission;
 static std::vector<std::pair<page_id, int>> g_history; // for Back
 
 // Input edges
-enum { a_up, a_down, a_left, a_right, a_accept, a_back, a_close, k_actions };
+enum { a_up, a_down, a_left, a_right, a_accept, a_back, a_close, a_delete, k_actions };
+// The splash screen when the launcher first opens: the name, then a fade into the menu.
+static int64_t g_splash_start; // GetTickCount64() when it began; 0: none
+static const int k_splash_hold = 3500, k_splash_out = 600, k_splash_in = 450;
+static bool splash_blocks_input()
+{
+    return g_splash_start && (int64_t)GetTickCount64() - g_splash_start < k_splash_hold + k_splash_out;
+}
 static bool g_prev[k_actions];
 static DWORD g_repeat_at[k_actions];
 static POINT g_last_mouse;
@@ -2311,8 +4546,9 @@ static std::atomic<bool> g_masking;
 static uint8_t g_masked_keys[256];
 static WORD g_masked_buttons;
 
-static D2D1_RECT_F g_item_rects[24];
+static D2D1_RECT_F g_item_rects[32];
 static int g_item_count, g_scroll;
+static int g_last_tile, g_last_bar, g_tile_scroll; // the main page's tiles and bar
 
 static int64_t now_ms() { return (int64_t)GetTickCount64(); }
 static void set_mouse_capture(bool on) { if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 1, on ? 1 : 0, 0); }
@@ -2359,8 +4595,12 @@ static void open_menu()
     logf("menu: opened, game paused");
 }
 
+// Hosting: which game and page (Custom game, Forge or Firefight) the LAN game is for.
+
 static void start_launcher()
 {
+    static bool first = true;
+    if (first) g_splash_start = (int64_t)GetTickCount64(), first = false;
     g_launcher = true;
     g_open = true;
     g_page = p_games;
@@ -2376,6 +4616,29 @@ static void start_launcher()
     g_difficulty = g_settings.difficulty;
     for (auto &p : g_prev) p = true;
     g_prev_click = g_prev_rclick = true;
+    // In a LAN game: back to its page (the host's Custom game page, or the lobby).
+    g_history.clear();
+    if (lan::g_role == lan::k_host && g_pick_game)
+    {
+        g_history.push_back({p_games, g_selected});
+        g_history.push_back({p_lan, 0});
+        g_page = p_lobby;
+        g_selected = 0;
+    }
+    else if (lan::g_role == lan::k_client)
+    {
+        g_history.push_back({p_games, g_selected});
+        g_history.push_back({p_lan, 0});
+        g_page = p_joined;
+        g_selected = 0;
+    }
+    // The first start: ask the player's name (once; Back keeps the computer's name).
+    else if (!g_settings.name_asked)
+    {
+        g_settings.name_asked = 1;
+        save_settings();
+        open_name_entry();
+    }
 }
 
 // ---- Controls pages: which game they edit, and waiting for a button or key.
@@ -2658,7 +4921,11 @@ static void open_picker(const std::wstring &title, std::vector<std::pair<std::ws
                         std::function<void(int)> done)
 {
     g_pick_title = title, g_pick_list = std::move(list), g_pick_done = std::move(done);
-    go(p_pick, std::max(0, current));
+    // Where the current choice is once group headings are added above the groups.
+    int row = std::max(0, current);
+    for (int i = 0; i <= current && i < (int)g_pick_list.size(); i++)
+        if (!g_pick_list[i].second.empty() && (i == 0 || g_pick_list[i - 1].second != g_pick_list[i].second)) row++;
+    go(p_pick, row);
 }
 
 static int find_variant(const std::vector<variant_choice> &v, const std::string &path)
@@ -2737,91 +5004,513 @@ static void add_player_items(std::vector<item> &items)
 }
 static int player_item_count() { return g_settings.players > 1 ? 2 : 1; }
 
-static std::vector<item> build_items()
+static item heading_item(const std::wstring &label)
 {
-    std::vector<item> items;
-    switch (g_page)
-    {
-    case p_games:
-        for (const auto &g : games())
+    item h{label, L"", nullptr, nullptr};
+    h.enabled = false;
+    h.heading = true;
+    return h;
+}
+
+// ---- LAN games: finding and joining them, and hosting one.
+static bool hosting_here(const game_entry *g, page_id page)
+{
+    return lan::g_role == lan::k_host && page == p_lobby;
+}
+
+
+// In the LAN lobby, a mode's items describe the game the host will start: tell the
+// players. True when building the lobby (the Start button then starts it for everyone).
+static page_id g_lobby_mode = p_campaign;
+static bool add_lan_items(std::vector<item> &items, const game_entry *g, page_id page, const std::wstring &map,
+                          const std::wstring &variant, const std::string &map_file = "")
+{
+    if (lan::g_role != lan::k_host || g_page != p_lobby) return false;
+    int mode = page == p_campaign ? 1 : page == p_spops ? 2 : page == p_firefight ? 5 : 3;
+    std::wstring detail = variant;
+    lan::set_lobby(narrow(g->folder), narrow(map.c_str()), narrow(variant.c_str()), false, mode, g_difficulty, map_file,
+                   narrow(detail.c_str()));
+    return true;
+}
+
+static std::wstring lobby_line(const lan::lobby_msg &m)
+{
+    std::wstring line;
+    std::wstring folder = lan::widen(lan::field(m.game, sizeof m.game));
+    const game_entry *g = folder.empty() ? nullptr : find_game(folder);
+    if (g) line = g->title;
+    std::string map = lan::field(m.map, sizeof m.map), variant = lan::field(m.variant, sizeof m.variant);
+    if (!map.empty()) line += (line.empty() ? L"" : L"  •  ") + lan::widen(map);
+    if (!variant.empty()) line += (line.empty() ? L"" : L"  •  ") + lan::widen(variant);
+    int n = std::max(1, (int)m.count);
+    line += (line.empty() ? L"" : L"  •  ") + std::to_wstring(n) + (n == 1 ? L" player" : L" players");
+    if (m.playing) line += L"  •  playing now";
+    return line;
+}
+
+// The address being typed on the Join by IP page.
+static std::string g_ip_text;
+static std::mutex g_typed_lock;
+static std::wstring g_typed;
+static void on_char(wchar_t c)
+{
+    std::lock_guard<std::mutex> l(g_typed_lock);
+    if (g_typed.size() < 64) g_typed += c;
+}
+
+static std::string guess_ip_start()
+{
+    if (!g_settings.lan_address.empty()) return g_settings.lan_address;
+    // This machine's own network: "192.168.1." for 192.168.1.20.
+    if (!lan::open()) return "";
+    INTERFACE_INFO list[32];
+    DWORD bytes = 0;
+    if (WSAIoctl(lan::g_sock, SIO_GET_INTERFACE_LIST, nullptr, 0, list, sizeof(list), &bytes, nullptr, nullptr) == 0)
+        for (DWORD i = 0; i < bytes / sizeof(INTERFACE_INFO); i++)
         {
-            if (!game_installed(g)) continue;
-            const game_entry *gp = &g;
-            item i{g.title, L"", [gp] { pick_game(gp); }, nullptr};
-            i.note = game_modes(gp);
-            items.push_back(i);
+            const INTERFACE_INFO &f = list[i];
+            if (!(f.iiFlags & IFF_UP) || (f.iiFlags & IFF_LOOPBACK) || f.iiAddress.Address.sa_family != AF_INET) continue;
+            std::string ip = lan::ip_text(f.iiAddress.AddressIn, false);
+            size_t dot = ip.find_last_of('.');
+            if (dot != std::string::npos) return ip.substr(0, dot + 1);
         }
-        if (items.empty())
+    return "";
+}
+
+static void step_ip(int d)
+{
+    size_t dot = g_ip_text.find_last_of('.');
+    std::string head = dot == std::string::npos ? "" : g_ip_text.substr(0, dot + 1);
+    std::string tail = dot == std::string::npos ? g_ip_text : g_ip_text.substr(dot + 1);
+    int v = tail.empty() ? 0 : atoi(tail.c_str());
+    if (tail.empty() && d < 0) v = 0;
+    else v = (v + d + 256) % 256;
+    g_ip_text = head + std::to_string(v);
+}
+
+static void join_typed()
+{
+    if (g_ip_text.empty()) return;
+    if (lan::join_text(g_ip_text))
+    {
+        g_settings.lan_address = g_ip_text;
+        save_settings();
+        go(p_joined);
+    }
+}
+
+static void open_lobby();
+static void build_lan_items(std::vector<item> &items)
+{
+    lan::search();
+    {
+        item host{lan::g_role == lan::k_host ? L"Your lobby" : L"Host a game", L"", [] { open_lobby(); }, nullptr};
+        host.note = !lan::g_problem.empty() ? lan::widen(lan::g_problem)
+                                            : L"Pick a game and what to play; others on your network join you";
+        items.push_back(host);
+    }
+    if (g_wine_math)
+    {
+        item w{L"Co-op with PCs needs one more file", L"", nullptr, nullptr};
+        w.note = L"Copy ucrtbase.dll from a Windows PC next to installation08.exe (README-PS5: LAN games)";
+        w.enabled = false;
+        items.push_back(w);
+    }
+    items.push_back(heading_item(L"Games on your network"));
+    std::string reason = lan::left_reason();
+    if (!reason.empty())
+    {
+        item r{lan::widen(reason), L"", nullptr, nullptr};
+        r.enabled = false;
+        items.push_back(r);
+    }
+    auto found = lan::found();
+    for (const auto &f : found)
+    {
+        lan::found_game game = f;
+        item it{lan::widen(lan::field(f.info.host, sizeof f.info.host)), L"", [game] {
+                    if (lan::join(game.addr, lan::field(game.info.host, sizeof game.info.host))) go(p_joined);
+                }, nullptr};
+        it.note = lobby_line(f.info);
+        items.push_back(it);
+    }
+    if (found.empty())
+    {
+        item none{L"Looking for games on your network…", L"", nullptr, nullptr};
+        none.note = L"Games hosted on your network show up here";
+        none.enabled = false;
+        items.push_back(none);
+    }
+    items.push_back({L"Join by IP address", L"", [] {
+                         g_ip_text = guess_ip_start();
+                         {
+                             std::lock_guard<std::mutex> l(g_typed_lock);
+                             g_typed.clear();
+                         }
+                         go(p_ip, 0);
+                     }, nullptr});
+}
+
+static void build_ip_items(std::vector<item> &items)
+{
+    {
+        std::wstring typed;
         {
-            item i{L"No Halo games found", L"", nullptr, nullptr};
-            if (g_cfg.mcc_given)
-            {
-                // Under Wine, Z: is the host's root: show the folder as the console sees it.
-                std::wstring where = g_cfg.mcc_root;
-                if (running_under_wine() && where.size() > 2 && (where[0] == L'Z' || where[0] == L'z') && where[1] == L':')
-                {
-                    where = where.substr(2);
-                    for (auto &c : where) if (c == L'\\') c = L'/';
-                }
-                i.note = L"Copy your MCC folders (halo1, halo2, halo3, halo3odst, haloreach, halo4) into " + where;
-            }
-            else
-                i.note = L"Put installation08.exe in the Halo The Master Chief Collection folder, or start it with --mcc <folder>";
+            std::lock_guard<std::mutex> l(g_typed_lock);
+            typed.swap(g_typed);
+        }
+        for (wchar_t c : typed)
+        {
+            if (c == 8) { if (!g_ip_text.empty()) g_ip_text.pop_back(); }
+            else if (((c >= L'0' && c <= L'9') || c == L'.' || c == L':') && g_ip_text.size() < 60) g_ip_text += (char)c;
+        }
+    }
+    bool blink = (GetTickCount64() / 500) % 2;
+    item a{L"Address", lan::widen(g_ip_text) + (blink ? L"_" : L" "), [] { join_typed(); }, [](int d) { step_ip(d); }};
+    a.note = L"Type it, or change the last number with left and right";
+    items.push_back(a);
+    item j{L"Join", L"", [] { join_typed(); }, nullptr};
+    std::string reason = lan::left_reason();
+    j.note = reason.empty() ? L"The other machine turns on LAN on a game's Custom game, Forge or Firefight page" : lan::widen(reason);
+    items.push_back(j);
+}
+
+static int check_lobby(const char *game, const char *map_file);
+static std::wstring status_text(int status, const std::wstring &game);
+static void build_joined_items(std::vector<item> &items)
+{
+    if (lan::g_role != lan::k_client)
+    {
+        std::string reason = lan::left_reason();
+        item r{reason.empty() ? L"Not in a LAN game" : lan::widen(reason), L"", nullptr, nullptr};
+        r.enabled = false;
+        items.push_back(r);
+        items.push_back({L"Back", L"", [] { go_back_one(); }, nullptr});
+        return;
+    }
+    lan::lobby_msg m = lan::host_lobby();
+    if (!lan::g_welcomed)
+    {
+        item look{L"Looking for " + lan::widen(lan::g_join_text) + L"…", L"", nullptr, nullptr};
+        look.note = L"The host picks Host a game under LAN games";
+        look.enabled = false;
+        items.push_back(look);
+    }
+    else
+    {
+        std::string host = lan::field(m.host, sizeof m.host);
+        item top{lan::widen(host.empty() ? lan::g_join_text : host), L"", nullptr, nullptr};
+        std::wstring folder = lan::widen(lan::field(m.game, sizeof m.game));
+        const game_entry *g = folder.empty() ? nullptr : find_game(folder);
+        int mine = m.game[0] ? check_lobby(m.game, m.map_file) : 0;
+        top.value = L"Host";
+        top.note = m.playing ? L"The host is playing a game; you'll be in the next one"
+                 : mine >= 2 ? L"You can't play this: " + status_text(mine, g ? g->title : folder)
+                 : m.game[0] ? L"Waiting for the host to start" : L"The host is choosing what to play";
+        top.enabled = false;
+        items.push_back(top);
+        auto info = [&](const wchar_t *label, const std::wstring &value) {
+            item i{label, value, nullptr, nullptr};
             i.enabled = false;
             items.push_back(i);
-        }
-        items.push_back({L"Settings", L"", [] { go(p_settings); }, nullptr});
-        items.push_back({L"Quit", L"", [] { go(p_quit, 1); }, nullptr});
-        break;
-    case p_pick:
-        for (size_t i = 0; i < g_pick_list.size(); i++)
+        };
+        if (m.game[0])
         {
-            int index = (int)i;
-            item it{g_pick_list[i].first, L"", [index] {
-                        auto done = g_pick_done;
-                        go_back_one();
-                        if (done) done(index);
-                    }, nullptr};
-            // A group's name on its first entry only, so the list reads as sections.
-            if (!g_pick_list[i].second.empty() && (i == 0 || g_pick_list[i - 1].second != g_pick_list[i].second))
-                it.note = g_pick_list[i].second;
-            items.push_back(it);
+            const wchar_t *modes[] = {L"", L"Campaign", L"Spartan Ops", L"Custom game", L"", L"Firefight"};
+            info(L"Game", g ? std::wstring(g->title) : folder);
+            if (m.mode < 6 && modes[m.mode][0]) info(L"Mode", modes[m.mode]);
+            if (m.map[0]) info(m.mode == 1 ? L"Mission" : L"Map", lan::widen(lan::field(m.map, sizeof m.map)));
+            if (m.mode == 1 || m.mode == 2 || m.mode == 5) info(L"Difficulty", difficulty_name(m.difficulty));
+            if (m.mode != 1 && m.variant[0]) info(L"Game type", lan::widen(lan::field(m.variant, sizeof m.variant)));
         }
-        break;
-    case p_setup: // a game's page: its modes
-    {
-        const game_entry *g = g_pick_game;
-        save_info save = read_save_info(g->folder);
-        if (save.exists)
+        if (m.count) items.push_back(heading_item(L"Players"));
+        for (int i = 0; i < m.count && i < 16; i++)
         {
-            std::wstring where;
-            for (const auto &mm : g->missions)
-                if (mm.map == save.map) where = mm.name;
-            std::wstring note = (where.empty() ? L"Saved game" : where) + L"  •  " + difficulty_name(save.difficulty) +
-                                (save.saved.empty() ? L"" : L"  •  " + std::wstring(save.saved.begin(), save.saved.end()));
-            item c{L"Continue campaign", L"", [g, note] {
-                       g_confirm_title = L"CONTINUE FROM LAST SAVE?";
-                       g_confirm_note = note;
-                       g_confirm_yes = [g] { continue_from_save(g->folder); };
-                       go(p_confirm, 0);
-                   }, nullptr};
-            c.note = note;
-            items.push_back(c);
+            std::wstring name = lan::widen(lan::field(m.names[i], 32));
+            item pl{name, i == 0 ? L"Host" : status_text(m.status[i], g ? g->title : folder), nullptr, nullptr};
+            pl.enabled = false;
+            items.push_back(pl);
         }
-        items.push_back({L"Campaign", L"", [g] {
-                             go(p_campaign, 2 + (g->module <= 1 ? 1 : 0) + player_item_count());
-                         }, nullptr});
-        if (!g->firefight.empty() && !installed_firefight_types(g).empty())
-            items.push_back({L"Firefight", L"", [] { go(p_firefight, 3 + player_item_count()); }, nullptr});
-        if (g->module == 3 && !installed_spops().empty())
-            items.push_back({L"Spartan Ops", L"", [] { go(p_spops, 3 + player_item_count()); }, nullptr});
-        if (!custom_maps(g->module).empty() && !installed_custom_types(g).empty())
-            items.push_back({L"Custom game", L"", [] { go(p_custom, 2 + player_item_count()); }, nullptr});
-        if (forge_type(g->module) && game_file_exists(g, "game_variants", forge_type(g->module)))
-            items.push_back({L"Forge", L"", [] { go(p_forge, 1 + player_item_count()); }, nullptr});
-        items.push_back({L"Controls", L"", [g] { open_controls(g->folder, g->module); }, nullptr});
-        break;
     }
+    items.push_back({L"Leave", L"", [] { lan::leave(); go_back_one(); }, nullptr});
+}
+
+// ---- Typing a short text (the service tag): keyboard, or left and right on the last letter.
+static std::wstring g_text_title, g_text_note;
+static std::string g_text;
+static size_t g_text_max = 4;
+static bool g_text_name; // a player name: upper and lower case, and spaces
+static std::function<void(const std::string &)> g_text_done;
+
+static void open_text(const std::wstring &title, const std::wstring &note, const std::string &text, size_t max,
+                      std::function<void(const std::string &)> done, bool name = false)
+{
+    g_text_title = title, g_text_note = note, g_text = text.substr(0, max), g_text_max = max, g_text_done = std::move(done);
+    g_text_name = name;
+    {
+        std::lock_guard<std::mutex> l(g_typed_lock);
+        g_typed.clear();
+    }
+    go(p_text, 1); // the keyboard's first row
+}
+static void text_finish()
+{
+    auto done = g_text_done;
+    std::string text = g_text;
+    go_back_one();
+    if (done) done(text);
+}
+static void build_text_items(std::vector<item> &items)
+{
+    {
+        std::wstring typed;
+        {
+            std::lock_guard<std::mutex> l(g_typed_lock);
+            typed.swap(g_typed);
+        }
+        for (wchar_t c : typed)
+        {
+            if (c == 8) { if (!g_text.empty()) g_text.pop_back(); }
+            else if (c < 128 && (isalnum((int)c) || (g_text_name && c == ' ')) && g_text.size() < g_text_max)
+                g_text += g_text_name ? (char)c : (char)toupper((int)c);
+        }
+    }
+    // An on-screen keyboard for a controller (the PS5 has no keyboard popup): a row of
+    // characters per item, left and right to pick one, A to type it.
+    static int col = 0;
+    static bool lower = false;
+    bool blink = (GetTickCount64() / 500) % 2;
+    item t{g_text_name ? L"Name" : L"Tag", lan::widen(g_text) + (blink ? L"_" : L" "), [] { text_finish(); }, nullptr};
+    t.note = g_text_note;
+    items.push_back(t);
+    const char *rows[] = {"ABCDEFGHIJKLM", "NOPQRSTUVWXYZ", "0123456789"};
+    for (int r = 0; r < 3; r++)
+    {
+        std::string row = rows[r];
+        if (lower && g_text_name && r < 2)
+            for (char &c : row) c = (char)tolower((unsigned char)c);
+        int n = (int)row.size();
+        int at = std::min(col, n - 1);
+        std::wstring label;
+        for (int i = 0; i < n; i++)
+        {
+            if (i) label += L"  ";
+            if (i == at && g_selected == (int)items.size()) label += std::wstring(L"[") + (wchar_t)row[i] + L"]";
+            else label += (wchar_t)row[i];
+        }
+        item k{label, L"", [row, n] {
+                   if (g_text.size() < g_text_max) g_text += row[std::min(col, n - 1)];
+               },
+               [n](int d) { col = (std::min(col, n - 1) + d + n) % n; }};
+        k.enabled = g_text.size() < g_text_max;
+        k.note = L"Left and right to pick, A to type";
+        items.push_back(k);
+    }
+    if (g_text_name)
+    {
+        item sp{L"Space", L"", [] { if (g_text.size() < g_text_max && !g_text.empty() && g_text.back() != ' ') g_text += ' '; }, nullptr};
+        sp.enabled = g_text.size() < g_text_max;
+        items.push_back(sp);
+        items.push_back({lower ? L"Capital letters" : L"Small letters", L"", [] { lower = !lower; }, nullptr});
+    }
+    items.push_back({L"Delete a letter", L"", [] { if (!g_text.empty()) g_text.pop_back(); }, nullptr});
+    items.push_back({L"Done", L"", [] { text_finish(); }, nullptr});
+}
+
+// ---- The player's name: in the games (player 1) and in LAN lobbies.
+static std::string clean_name(const std::string &in)
+{
+    std::string out;
+    for (char c : in)
+        if ((unsigned char)c < 128 && (isalnum((unsigned char)c) || c == ' ') && out.size() < 15 && !(c == ' ' && (out.empty() || out.back() == ' ')))
+            out += c;
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+static std::string default_name()
+{
+    wchar_t computer[64];
+    DWORD n = 64;
+    std::string c = GetComputerNameW(computer, &n) ? clean_name(narrow(computer)) : "";
+    return c.empty() ? "Player" : c;
+}
+static void open_name_entry()
+{
+    std::string now = clean_name(g_settings.lan_name);
+    if (now.empty()) now = default_name();
+    open_text(L"ENTER YOUR PLAYER NAME",
+              L"Shown in the games and to other players in LAN games. Up to 15 letters, numbers and spaces",
+              now, 15,
+              [](const std::string &text) {
+                  std::string name = clean_name(text);
+                  if (name.empty()) return;
+                  g_settings.lan_name = name;
+                  lan::g_name = name;
+                  save_settings();
+                  logf("player name: %s", name.c_str());
+              },
+              true);
+}
+
+// ---- Armor and colors, the service tag, and Halo 4's loadouts.
+static void look_changed(const game_entry *g)
+{
+    save_settings();
+    if (!g_launcher && g && !_wcsicmp(g->folder, g_cfg.game.c_str())) apply_look(narrow(g_cfg.game.c_str()), g_module);
+}
+
+static void build_look_items(std::vector<item> &items)
+{
+    const game_entry *g = g_pick_game;
+    if (!g) return;
+    std::string game = narrow(g->folder);
+    {
+        std::string tag = g_settings.service_tag;
+        item t{L"Service tag", tag.empty() ? L"None" : lan::widen(tag), [g] {
+                   open_text(L"SERVICE TAG", L"Up to four letters and numbers", g_settings.service_tag, 4,
+                             [g](const std::string &text) {
+                                 g_settings.service_tag = text;
+                                 look_changed(g);
+                             });
+               }, nullptr};
+        t.note = L"Shown over your head and on the scoreboard, in every game";
+        items.push_back(t);
+    }
+    if (look_has_species(g->module))
+    {
+        std::string key = look_key(game, "species");
+        bool elite = g_settings.look[key] == "elite";
+        auto flip = [g, key] {
+            g_settings.look[key] = g_settings.look[key] == "elite" ? "" : "elite";
+            look_changed(g);
+        };
+        item s{L"Multiplayer species", elite ? L"Elite" : L"Spartan", flip, [flip](int) { flip(); }};
+        s.note = L"Where the game type allows it";
+        items.push_back(s);
+    }
+    int section = -1;
+    static const wchar_t *k_sections[] = {L"Colors", L"Armor", L"Elite", L"Other"};
+    for (const auto &slot : look_slots(g->module))
+    {
+        if (slot.section != section) items.push_back(heading_item(k_sections[section = slot.section]));
+        std::string key = look_key(game, slot.key);
+        auto choices = look_choices(slot);
+        int at = 0; // 0: the game's default; i + 1: choices[i]
+        const std::string &cur = g_settings.look[key];
+        for (size_t i = 0; i < choices.size(); i++)
+            if (!_stricmp(choices[i]->name, cur.c_str())) at = (int)i + 1;
+        int n = (int)choices.size() + 1;
+        auto set = [g, key, choices](int i) {
+            g_settings.look[key] = i > 0 && i <= (int)choices.size() ? choices[i - 1]->name : "";
+            look_changed(g);
+        };
+        item it{slot.label, at ? look_name(choices[at - 1]->name) : L"Not set", [slot, at, choices, set] {
+                    std::vector<std::pair<std::wstring, std::wstring>> list;
+                    list.push_back({L"Not set (the game's own)", L""});
+                    for (const auto *c : choices) list.push_back({look_name(c->name), L""});
+                    std::wstring title = slot.label;
+                    for (auto &c : title) c = towupper(c);
+                    open_picker(title, list, at, set);
+                }, [at, n, set](int d) { set((at + d + n) % n); }};
+        it.note = std::to_wstring(n - 1) + L" to choose from";
+        items.push_back(it);
+    }
+}
+
+static int g_loadout_edit; // the loadout being edited (0-4)
+static std::wstring loadout_line(int n)
+{
+    const auto &f = loadout_fields();
+    const int *l = g_settings.loadout[n];
+    return loadout_value_name(f[0], l[0]) + L"  •  " + loadout_value_name(f[1], l[1]) + L"  •  " +
+           loadout_value_name(f[3], l[3]);
+}
+static void build_loadouts_items(std::vector<item> &items)
+{
+    for (int n = 0; n < 5; n++)
+    {
+        item it{L"Loadout " + std::to_wstring(n + 1), L"", [n] { g_loadout_edit = n; go(p_loadout, 0); }, nullptr};
+        it.note = loadout_line(n);
+        items.push_back(it);
+    }
+    item about{L"Custom games whose game type allows personal loadouts offer these", L"", nullptr, nullptr};
+    about.enabled = false;
+    items.push_back(about);
+}
+static void build_loadout_items(std::vector<item> &items)
+{
+    int n = g_loadout_edit;
+    const auto &fields = loadout_fields();
+    for (size_t i = 0; i < fields.size(); i++)
+    {
+        const loadout_field &f = fields[i];
+        int v = g_settings.loadout[n][i], count = (int)f.items.size(), at = loadout_position(f, v);
+        auto set = [n, i](int position) {
+            g_settings.loadout[n][i] = loadout_fields()[i].items[position].index;
+            g_settings.loadout_set[n] = true;
+            look_changed(find_game(L"halo4"));
+        };
+        item it{f.label, loadout_value_name(f, v), [i, at, set] {
+                    const loadout_field &f = loadout_fields()[i];
+                    std::vector<std::pair<std::wstring, std::wstring>> list;
+                    for (const auto &e : f.items) list.push_back({e.name, L""});
+                    std::wstring title = f.label;
+                    for (auto &c : title) c = towupper(c);
+                    open_picker(title, list, std::max(0, at), set);
+                }, [at, count, set](int d) { set(((at < 0 ? 0 : at + d) + count) % count); }};
+        if (i < 2) it.note = L"Any weapon can go in either slot";
+        items.push_back(it);
+    }
+}
+
+// ---- Custom game and Forge pages: a Forge map saved on the chosen map.
+static std::string map_variant_key(const game_entry *g, const mission_entry &m)
+{
+    std::string file = m.file;
+    for (auto &c : file) c = (char)tolower((unsigned char)c);
+    return narrow(g->folder) + "_" + file;
+}
+static std::wstring chosen_map_variant(const game_entry *g, const mission_entry &m)
+{
+    if (!forge_type(g->module)) return L"";
+    auto it = g_settings.map_variant.find(map_variant_key(g, m));
+    if (it == g_settings.map_variant.end() || it->second.empty()) return L"";
+    std::wstring path = map_variant_dir(g->folder, m.file) + L"\\" + lan::widen(it->second) + L".mvar";
+    return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES ? L"" : path;
+}
+static void add_map_variant_item(std::vector<item> &items, const game_entry *g, const mission_entry &m)
+{
+    if (!forge_type(g->module)) return;
+    std::string key = map_variant_key(g, m);
+    std::vector<std::wstring> list = saved_map_variants(g->folder, m.file);
+    std::wstring cur = lan::widen(g_settings.map_variant[key]);
+    int at = 0;
+    for (size_t i = 0; i < list.size(); i++)
+        if (!_wcsicmp(list[i].c_str(), cur.c_str())) at = (int)i + 1;
+    int n = (int)list.size() + 1;
+    auto set = [key, list](int i) {
+        g_settings.map_variant[key] = i > 0 && i <= (int)list.size() ? narrow(list[i - 1].c_str()) : "";
+        save_settings();
+    };
+    item it{L"Map variant", at ? list[at - 1] : L"Original", [list, at, set] {
+                std::vector<std::pair<std::wstring, std::wstring>> choices;
+                choices.push_back({L"Original", L""});
+                for (const auto &s : list) choices.push_back({s, L"Saved in Forge"});
+                open_picker(L"SELECT MAP VARIANT", choices, at, set);
+            }, [at, n, set](int d) { set((at + d + n) % n); }};
+    it.note = list.empty() ? L"Maps you save in Forge (pause menu, Save map) appear here"
+                           : L"The map as it comes, or one you saved in Forge";
+    items.push_back(it);
+}
+
+static bool forge_session() { return g_mode == 3 && forge_type(g_module) && g_ff_variant.find(forge_type(g_module)) != std::string::npos; }
+
+// A mode's page (campaign, Firefight, Spartan Ops, custom game, Forge): its choices and
+// Start. The LAN lobby shows the same items for the mode the host picked.
+static void build_mode_items(page_id page, std::vector<item> &items)
+{
+    switch (page)
+    {
     case p_campaign:
     {
         const game_entry *g = g_pick_game;
@@ -2843,8 +5532,29 @@ static std::vector<item> build_items()
             gr.note = std::wstring(btn(L"Back")) + L" switches between them in the game";
             items.push_back(gr);
         }
-        add_player_items(items);
-        items.push_back({L"Start campaign", L"", [g] {
+        bool hosting = add_lan_items(items, g, p_campaign, m.name, std::wstring(L"Campaign, ") + difficulty_name(g_difficulty), m.file);
+        if (!hosting) add_player_items(items);
+        // Co-op continue: the last co-op checkpoint, with whoever has joined now.
+        if (k_coop_continue && hosting && !lan::joined_names().empty())
+        {
+            save_info cs = read_save_info(g->folder, true);
+            if (cs.exists)
+            {
+                std::wstring where = lan::widen(cs.file);
+                for (const auto &mm : g->missions)
+                    if (mm.map == cs.map) where = mm.name;
+                item c{L"Continue co-op", where, [g] {
+                           save_info i = read_save_info(g->folder, true);
+                           if (!i.exists) return;
+                           relaunch(g->folder, i.map, i.file, i.difficulty);
+                           g_next.resume = g_next.coop = true;
+                           logf("next: continue the co-op saved game");
+                       }, nullptr};
+                c.note = std::wstring(difficulty_name(cs.difficulty)) + L", saved " + lan::widen(cs.saved);
+                items.push_back(c);
+            }
+        }
+        items.push_back({hosting && !lan::joined_names().empty() ? L"Start LAN co-op" : L"Start campaign", L"", [g] {
                              const mission_entry &mm = g->missions[g_pick_mission];
                              relaunch(g->folder, mm.map, mm.file, g_difficulty);
                          }, nullptr});
@@ -2877,8 +5587,9 @@ static std::vector<item> build_items()
         items.push_back(gt);
         items.push_back({L"Difficulty", difficulty_name(g_difficulty), [] { g_difficulty = (g_difficulty + 1) % 4; },
                          [](int d) { g_difficulty = (g_difficulty + d + 4) % 4; }});
-        add_player_items(items);
-        items.push_back({L"Start Firefight", L"", [g, mi, ti] {
+        bool hosting = add_lan_items(items, g, p_firefight, g->firefight[*mi].name, types[ti].name, g->firefight[*mi].file);
+        if (!hosting) add_player_items(items);
+        items.push_back({hosting && !lan::joined_names().empty() ? L"Start LAN Firefight" : L"Start Firefight", L"", [g, mi, ti] {
                              const mission_entry &m = g->firefight[*mi];
                              relaunch_mode(5, g->folder, m.map, m.file, game_variants_for(g, true)[ti].path, g_difficulty);
                          }, nullptr});
@@ -2910,10 +5621,13 @@ static std::vector<item> build_items()
                 }};
         gt.note = types[ti].group;
         items.push_back(gt);
-        add_player_items(items);
-        items.push_back({L"Start game", L"", [g, mi, ti] {
+        add_map_variant_item(items, g, maps[*mi]);
+        bool hosting = add_lan_items(items, g, p_custom, maps[*mi].name, types[ti].name, maps[*mi].file);
+        if (!hosting) add_player_items(items);
+        items.push_back({hosting && !lan::joined_names().empty() ? L"Start LAN game" : L"Start game", L"", [g, mi, ti] {
                              const mission_entry &m = custom_maps(g->module)[*mi];
-                             relaunch_mode(3, g->folder, m.map, m.file, game_variants_for(g, false)[ti].path, g_difficulty);
+                             relaunch_mode(3, g->folder, m.map, m.file, game_variants_for(g, false)[ti].path, g_difficulty,
+                                           chosen_map_variant(g, m));
                          }, nullptr});
         break;
     }
@@ -2928,11 +5642,13 @@ static std::vector<item> build_items()
         items.push_back({L"Map", maps[*mi].name, [g, mi] {
                              open_picker(L"SELECT MAP", map_list(custom_maps(g->module)), *mi, [mi](int i) { *mi = i; save_settings(); });
                          }, [mi, nm](int d) { *mi = (*mi + d + nm) % nm; save_settings(); }});
-        add_player_items(items);
-        items.push_back({L"Start Forge", L"", [g, mi] {
+        add_map_variant_item(items, g, maps[*mi]);
+        bool hosting = add_lan_items(items, g, p_forge, maps[*mi].name, L"Forge", maps[*mi].file);
+        if (!hosting) add_player_items(items);
+        items.push_back({hosting && !lan::joined_names().empty() ? L"Start LAN Forge" : L"Start Forge", L"", [g, mi] {
                              const mission_entry &m = custom_maps(g->module)[*mi];
                              relaunch_mode(3, g->folder, m.map, m.file, std::string("game_variants\\") + forge_type(g->module),
-                                           g_difficulty);
+                                           g_difficulty, chosen_map_variant(g, m));
                          }, nullptr});
         break;
     }
@@ -2969,8 +5685,9 @@ static std::vector<item> build_items()
         items.push_back(mi);
         items.push_back({L"Difficulty", difficulty_name(g_difficulty), [] { g_difficulty = (g_difficulty + 1) % 4; },
                          [](int d) { g_difficulty = (g_difficulty + d + 4) % 4; }});
-        add_player_items(items);
-        items.push_back({L"Start mission", L"", [] {
+        bool hosting = add_lan_items(items, g_pick_game, p_spops, m.map_name, L"Spartan Ops");
+        if (!hosting) add_player_items(items);
+        items.push_back({hosting && !lan::joined_names().empty() ? L"Start LAN co-op" : L"Start mission", L"", [] {
                              const spops_mission &m = spops_missions()[g_settings.spops];
                              char file[64];
                              snprintf(file, sizeof file, "spops_e%d", m.episode);
@@ -2978,14 +5695,347 @@ static std::vector<item> build_items()
                          }, nullptr});
         break;
     }
+    default:
+        break;
+    }
+}
+
+// ---- The LAN lobby.
+// Can this machine play a lobby's choice? (Runs on the LAN thread for the hello.)
+static bool map_file_installed(const game_entry *g, const std::string &file)
+{
+    if (file.empty()) return true;
+    std::wstring f = lan::widen(file) + L".map";
+    std::wstring base = g_cfg.mcc_root + L"\\" + g->folder + L"\\";
+    for (const wchar_t *dir : {L"maps\\", L"h2_maps_win64_dx11\\"})
+        if (GetFileAttributesW((base + dir + f).c_str()) != INVALID_FILE_ATTRIBUTES) return true;
+    return false;
+}
+static std::string read_coop_save(const char *game)
+{
+    std::wstring g;
+    for (const char *c = game; *c; c++)
+    {
+        if (!isalnum((unsigned char)*c) && *c != '_') return std::string(); // a folder name only
+        g += (wchar_t)*c;
+    }
+    return g.empty() ? std::string() : read_file(coop_save_path(g));
+}
+static int check_lobby(const char *game, const char *map_file)
+{
+    const game_entry *g = find_game(lan::widen(lan::field(game, 16)));
+    if (!g || !game_installed(*g)) return 2;
+    return map_file_installed(g, lan::field(map_file, 48)) ? 1 : 3;
+}
+static std::wstring status_text(int status, const std::wstring &game)
+{
+    switch (status)
+    {
+    case 1: return L"Ready";
+    case 2: return L"Doesn't have " + game;
+    case 3: return L"Doesn't have this map (install its part of " + game + L")";
+    }
+    return L"Checking\u2026";
+}
+
+// The modes a game offers, as on its page.
+static std::vector<std::pair<page_id, const wchar_t *>> lobby_modes(const game_entry *g)
+{
+    std::vector<std::pair<page_id, const wchar_t *>> out = {{p_campaign, L"Campaign"}};
+    if (!g->firefight.empty() && !installed_firefight_types(g).empty()) out.push_back({p_firefight, L"Firefight"});
+    if (g->module == 3 && !installed_spops().empty()) out.push_back({p_spops, L"Spartan Ops"});
+    if (!custom_maps(g->module).empty() && !installed_custom_types(g).empty()) out.push_back({p_custom, L"Custom game"});
+    if (forge_type(g->module) && game_file_exists(g, "game_variants", forge_type(g->module))) out.push_back({p_forge, L"Forge"});
+    return out;
+}
+
+static void pick_lobby_game(const game_entry *g)
+{
+    g_pick_game = g;
+    g_pick_mission = 0;
+    auto it = g_settings.last_map.find(narrow(g->folder));
+    for (size_t i = 0; i < g->missions.size(); i++)
+        if (it != g_settings.last_map.end() && g->missions[i].map == it->second) g_pick_mission = (int)i;
+    bool ok = false;
+    for (const auto &m : lobby_modes(g))
+        if (m.first == g_lobby_mode) ok = true;
+    if (!ok) g_lobby_mode = p_campaign;
+}
+
+static void open_lobby()
+{
+    if (lan::g_role != lan::k_host)
+    {
+        if (lan::g_role == lan::k_client) lan::leave();
+        if (!lan::host_open()) return;
+    }
+    if (!g_pick_game || !game_installed(*g_pick_game))
+    {
+        const game_entry *first = nullptr;
+        for (const auto &g : games())
+            if (game_installed(g) && (!first || narrow(g.folder) == g_settings.last_game)) first = &g;
+        if (!first) return;
+        pick_lobby_game(first);
+    }
+    go(p_lobby, 0);
+}
+
+static void build_lobby_items(std::vector<item> &items)
+{
+    if (lan::g_role != lan::k_host || !g_pick_game)
+    {
+        item r{L"Not hosting", L"", nullptr, nullptr};
+        r.enabled = false;
+        items.push_back(r);
+        return;
+    }
+    const game_entry *g = g_pick_game;
+    // The game and mode, then the mode's own choices (which also tell the players).
+    std::vector<std::pair<std::wstring, std::wstring>> list;
+    std::vector<const game_entry *> installed;
+    int at = 0;
+    for (const auto &x : games())
+        if (game_installed(x))
+        {
+            if (&x == g) at = (int)installed.size();
+            installed.push_back(&x), list.push_back({x.title, L""});
+        }
+    items.push_back({L"Game", g->title, [list, at, installed] {
+                         open_picker(L"SELECT GAME", list, at, [installed](int i) { pick_lobby_game(installed[i]); });
+                     }, [at, installed](int d) {
+                         int n = (int)installed.size();
+                         pick_lobby_game(installed[(at + d + n) % n]);
+                     }});
+    auto modes = lobby_modes(g);
+    int mi = 0;
+    for (size_t i = 0; i < modes.size(); i++)
+        if (modes[i].first == g_lobby_mode) mi = (int)i;
+    g_lobby_mode = modes[mi].first;
+    items.push_back({L"Mode", modes[mi].second, [modes, mi] { g_lobby_mode = modes[(mi + 1) % modes.size()].first; },
+                     [modes, mi](int d) {
+                         int n = (int)modes.size();
+                         g_lobby_mode = modes[(mi + d + n) % n].first;
+                     }});
+    size_t first_mode_item = items.size();
+    build_mode_items(g_lobby_mode, items);
+    // Players, and whether each can play this.
+    auto players = lan::lobby_players();
+    std::vector<uint64_t> cannot;
+    std::wstring cannot_names;
+    std::vector<item> who;
+    who.push_back(heading_item(L"Players"));
+    {
+        item me{lan::widen(lan::g_name), L"Host", nullptr, nullptr};
+        me.enabled = false;
+        who.push_back(me);
+    }
+    for (const auto &p : players)
+    {
+        item pi{lan::widen(p.name), status_text(p.status, g->title), nullptr, nullptr};
+        pi.enabled = false;
+        who.push_back(pi);
+        if (p.status >= 2)
+        {
+            cannot.push_back(p.id);
+            cannot_names += (cannot_names.empty() ? L"" : L", ") + lan::widen(p.name);
+        }
+    }
+    if (players.empty())
+    {
+        item w{L"Waiting for players\u2026", L"", nullptr, nullptr};
+        w.note = L"They pick LAN games on their main menu and choose " + lan::widen(lan::g_name);
+        w.enabled = false;
+        who.push_back(w);
+    }
+    // The Start button (and Continue co-op) are the mode's last items: players go just above them.
+    size_t starts = items.size();
+    while (starts > first_mode_item && (items[starts - 1].label.rfind(L"Start", 0) == 0 || items[starts - 1].label == L"Continue co-op"))
+        starts--;
+    items.insert(items.begin() + starts, who.begin(), who.end());
+    if (!cannot.empty())
+        for (size_t i = starts + who.size(); i < items.size(); i++)
+        {
+            auto start = items[i].activate;
+            items[i].activate = [start, cannot, cannot_names] {
+                g_confirm_title = L"START WITHOUT THEM?";
+                g_confirm_note = cannot_names + L" can't play this and will stay in the lobby";
+                g_confirm_yes = [start, cannot] {
+                    lan::g_left_out = cannot;
+                    start();
+                };
+                go(p_confirm, 1);
+            };
+            items[i].note = cannot_names + L" can't play this";
+        }
+    items.push_back({L"Close lobby", L"", [] {
+                         if (!lan::joined_names().empty())
+                         {
+                             g_confirm_title = L"CLOSE THE LOBBY?";
+                             g_confirm_note = L"The players who joined go back to their menus";
+                             g_confirm_yes = [] { lan::host_close(); go_back_one(); };
+                             go(p_confirm, 1);
+                         }
+                         else lan::host_close(), go_back_one();
+                     }, nullptr});
+}
+
+static std::vector<item> build_items()
+{
+    lan::g_check_lobby = check_lobby;
+    lan::g_read_coop_save = read_coop_save;
+    std::vector<item> items;
+    switch (g_page)
+    {
+    case p_games:
+        for (const auto &g : games())
+        {
+            if (!game_installed(g)) continue;
+            const game_entry *gp = &g;
+            item i{g.title, L"", [gp] { pick_game(gp); }, nullptr};
+            i.note = game_modes(gp);
+            i.tile = g.folder;
+            items.push_back(i);
+        }
+        if (items.empty())
+        {
+            item i{L"No Halo games found", L"", nullptr, nullptr};
+            if (g_cfg.mcc_given)
+            {
+                // Under Wine, Z: is the host's root: show the folder as the console sees it.
+                std::wstring where = g_cfg.mcc_root;
+                if (running_under_wine() && where.size() > 2 && (where[0] == L'Z' || where[0] == L'z') && where[1] == L':')
+                {
+                    where = where.substr(2);
+                    for (auto &c : where) if (c == L'\\') c = L'/';
+                }
+                i.note = L"Copy your MCC folders (halo1, halo2, halo3, halo3odst, haloreach, halo4) into " + where;
+            }
+            else
+                i.note = L"Put installation08.exe in the Halo The Master Chief Collection folder, or start it with --mcc <folder>";
+            i.enabled = false;
+            items.push_back(i);
+        }
+        {
+            item lan_item{L"LAN games", L"", [] {
+                              go(lan::g_role == lan::k_client ? p_joined : p_lan);
+                          }, nullptr};
+            lan_item.note = lan::g_role == lan::k_client ? L"In a game" : L"Play with others on your network";
+            items.push_back(lan_item);
+        }
+        items.push_back({L"Settings", L"", [] { go(p_settings); }, nullptr});
+        items.push_back({L"Quit", L"", [] { go(p_quit, 1); }, nullptr});
+        break;
+    case p_lan:
+        build_lan_items(items);
+        break;
+    case p_ip:
+        build_ip_items(items);
+        break;
+    case p_joined:
+        build_joined_items(items);
+        break;
+    case p_lobby:
+        build_lobby_items(items);
+        break;
+    case p_text:
+        build_text_items(items);
+        break;
+    case p_look:
+        build_look_items(items);
+        break;
+    case p_loadouts:
+        build_loadouts_items(items);
+        break;
+    case p_loadout:
+        build_loadout_items(items);
+        break;
+    case p_pick:
+        for (size_t i = 0; i < g_pick_list.size(); i++)
+        {
+            int index = (int)i;
+            item it{g_pick_list[i].first, L"", [index] {
+                        auto done = g_pick_done;
+                        go_back_one();
+                        if (done) done(index);
+                    }, nullptr};
+            // A group's name above its first entry, so the list reads as sections.
+            if (!g_pick_list[i].second.empty() && (i == 0 || g_pick_list[i - 1].second != g_pick_list[i].second))
+                items.push_back(heading_item(g_pick_list[i].second));
+            items.push_back(it);
+        }
+        break;
+    case p_setup: // a game's page: its modes
+    {
+        const game_entry *g = g_pick_game;
+        save_info save = read_save_info(g->folder);
+        if (save.exists)
+        {
+            std::wstring where;
+            for (const auto &mm : g->missions)
+                if (mm.map == save.map) where = mm.name;
+            std::wstring note = (where.empty() ? L"Saved game" : where) + L"  •  " + difficulty_name(save.difficulty) +
+                                (save.saved.empty() ? L"" : L"  •  " + std::wstring(save.saved.begin(), save.saved.end()));
+            item c{L"Continue campaign", L"", [g, note] {
+                       g_confirm_title = L"CONTINUE FROM LAST SAVE?";
+                       g_confirm_note = note;
+                       g_confirm_yes = [g] { continue_from_save(g->folder); };
+                       go(p_confirm, 0);
+                   }, nullptr};
+            c.note = note;
+            items.push_back(c);
+        }
+        items.push_back({L"Campaign", L"", [g] {
+                             go(p_campaign, 2 + (g->module <= 1 ? 1 : 0) + player_item_count());
+                         }, nullptr});
+        if (!g->firefight.empty() && !installed_firefight_types(g).empty())
+            items.push_back({L"Firefight", L"", [] { go(p_firefight, 99); }, nullptr});
+        if (g->module == 3 && !installed_spops().empty())
+            items.push_back({L"Spartan Ops", L"", [] { go(p_spops, 3 + player_item_count()); }, nullptr});
+        if (!custom_maps(g->module).empty() && !installed_custom_types(g).empty())
+            items.push_back({L"Custom game", L"", [g] { go(p_custom, 99); }, nullptr});
+        if (forge_type(g->module) && game_file_exists(g, "game_variants", forge_type(g->module)))
+            items.push_back({L"Forge", L"", [] { go(p_forge, 99); }, nullptr});
+        if (!look_slots(g->module).empty())
+            items.push_back({L"Armor and colors", L"", [] { go(p_look, 0); }, nullptr});
+        if (g->module == 3) items.push_back({L"Loadouts", L"", [] { go(p_loadouts, 0); }, nullptr});
+        items.push_back({L"Controls", L"", [g] { open_controls(g->folder, g->module); }, nullptr});
+        break;
+    }
+    case p_campaign:
+    case p_firefight:
+    case p_custom:
+    case p_forge:
+    case p_spops:
+        build_mode_items(g_page, items);
+        break;
     case p_main:
         items.push_back({L"Resume", L"", [] { close_menu(); }, nullptr});
         if (g_mode != 1)
         {
+            if (!(lan::g_role == lan::k_client && !lan::g_seats.empty()))
             items.push_back({g_mode == 5 ? L"Restart Firefight" : g_mode == 3 ? L"Restart game" : L"Restart mission", L"", [] {
+                                 std::wstring map_variant;
+                                 {
+                                     std::lock_guard<std::mutex> l(g_forge_lock);
+                                     map_variant = g_map_variant_path;
+                                 }
                                  relaunch_mode(g_mode, g_cfg.game, g_cfg.map, narrow(g_cfg.map_file.c_str()), g_ff_variant,
-                                               g_difficulty);
+                                               g_difficulty, map_variant);
                              }, nullptr});
+            if (forge_session())
+            {
+                std::wstring loaded = loaded_map_variant_name(), status = forge_status();
+                item save{L"Save map", status, [] { request_forge_save(false); }, nullptr};
+                save.note = loaded.empty() ? L"Saves this map as a new map variant, for Forge and custom games"
+                                           : L"Saves over \u201C" + loaded + L"\u201D";
+                items.push_back(save);
+                if (!loaded.empty())
+                {
+                    item copy{L"Save as a new map", L"", [] { request_forge_save(true); }, nullptr};
+                    copy.note = L"Keeps \u201C" + loaded + L"\u201D as it was";
+                    items.push_back(copy);
+                }
+            }
             if (g_mode != 3)
             {
                 item d{L"Difficulty", difficulty_name(g_difficulty), [] { g_difficulty = (g_difficulty + 1) % 4; },
@@ -2995,7 +6045,47 @@ static std::vector<item> build_items()
             }
             items.push_back({L"Settings", L"", [] { go(p_settings); }, nullptr});
             items.push_back({L"Controls", L"", [] { open_controls(g_cfg.game, g_module); }, nullptr});
+            if (!look_slots(g_module).empty() && find_game(g_cfg.game))
+            {
+                item look{L"Armor and colors", L"", [] { g_pick_game = find_game(g_cfg.game); go(p_look, 0); }, nullptr};
+                look.note = L"Changes show from the next game you start";
+                items.push_back(look);
+            }
             items.push_back({L"Return to main menu", L"", [] { relaunch(L"", 0, "", g_difficulty); }, nullptr});
+            items.push_back({L"Quit to desktop", L"", [] { go(p_quit, 1); }, nullptr});
+            break;
+        }
+        if (!lan::g_seats.empty())
+        {
+            // LAN co-op: the host chooses the mission; nobody's saved game changes.
+            bool host = lan::g_role == lan::k_host;
+            if (host)
+            {
+                items.push_back({L"Revert to last checkpoint", L"", [] {
+                                     close_menu();
+                                     if (g_engine) g_engine->post_command("HS: game_revert");
+                                     logf("menu: revert to checkpoint");
+                                 }, nullptr});
+                items.push_back({L"Restart mission", L"", [] {
+                                     const mission_entry *m = current_mission();
+                                     if (m) relaunch(g_cfg.game, m->map, m->file, g_difficulty);
+                                     else relaunch(g_cfg.game, g_cfg.map, narrow(g_cfg.map_file.c_str()), g_difficulty);
+                                 }, nullptr});
+                if (find_game(g_cfg.game)) items.push_back({L"Select mission", L"", [] { go(p_missions); }, nullptr});
+                item d{L"Difficulty", difficulty_name(g_difficulty), [] { g_difficulty = (g_difficulty + 1) % 4; },
+                       [](int dir) { g_difficulty = (g_difficulty + dir + 4) % 4; }};
+                d.note = L"Takes effect when the mission restarts";
+                items.push_back(d);
+            }
+            items.push_back({L"Settings", L"", [] { go(p_settings); }, nullptr});
+            items.push_back({L"Controls", L"", [] { open_controls(g_cfg.game, g_module); }, nullptr});
+            item back{host ? L"End co-op" : L"Leave co-op", L"", [] {
+                           logf("menu: end co-op");
+                           relaunch(L"", 0, "", g_difficulty);
+                       }, nullptr};
+            back.note = host ? L"Ends the game for everyone. Co-op starts from the mission's beginning next time"
+                             : L"Leaves the game on this machine";
+            items.push_back(back);
             items.push_back({L"Quit to desktop", L"", [] { go(p_quit, 1); }, nullptr});
             break;
         }
@@ -3018,6 +6108,12 @@ static std::vector<item> build_items()
         }
         items.push_back({L"Settings", L"", [] { go(p_settings); }, nullptr});
         items.push_back({L"Controls", L"", [] { open_controls(g_cfg.game, g_module); }, nullptr});
+        if (!look_slots(g_module).empty() && find_game(g_cfg.game))
+        {
+            item look{L"Armor and colors", L"", [] { g_pick_game = find_game(g_cfg.game); go(p_look, 0); }, nullptr};
+            look.note = L"Changes show from the next game you start";
+            items.push_back(look);
+        }
         {
             item sq{L"Save and quit", L"", [] {
                         g_confirm_title = L"SAVE AND QUIT?";
@@ -3055,23 +6151,71 @@ static std::vector<item> build_items()
     }
     case p_settings:
     {
+        std::string name = lan::g_name.empty() ? default_name() : lan::g_name;
+        item nm{L"Your name", lan::widen(name), [] { open_name_entry(); }, nullptr};
+        nm.note = L"In the games, and in LAN lobbies";
+        items.push_back(nm);
+    }
+        items.push_back({L"Controls", L"", [] { go(p_set_controls); }, nullptr});
+        items.push_back({L"Video", L"", [] { go(p_set_video); }, nullptr});
+        items.push_back({L"Audio", L"", [] { go(p_set_audio); }, nullptr});
+        items.push_back({L"Accessibility", L"", [] { go(p_set_access); }, nullptr});
+        items.back().note = L"Most changes apply when this menu closes; a few, from the next game you start";
+        break;
+    case p_set_controls:
+    case p_set_video:
+    case p_set_audio:
+    case p_set_access:
+    {
         auto adj = [](int *v, int lo, int hi, int by) {
             return [v, lo, hi, by](int d) { step(*v, d, lo, hi, by); apply_settings(); };
         };
-        items.push_back({L"Master volume", pct(g_settings.master), nullptr, adj(&g_settings.master, 0, 100, 5)});
-        items.push_back({L"Music volume", pct(g_settings.music), nullptr, adj(&g_settings.music, 0, 100, 5)});
-        items.push_back({L"Effects volume", pct(g_settings.effects), nullptr, adj(&g_settings.effects, 0, 100, 5)});
-        wchar_t sens[16];
-        swprintf(sens, 16, L"%.1f", g_settings.mouse);
-        items.push_back({L"Mouse sensitivity", sens, nullptr, [](int d) {
-                             g_settings.mouse = std::max(0.1f, std::min(5.0f, g_settings.mouse + d * 0.1f));
-                             apply_settings();
-                         }});
-        items.push_back({L"Invert look (controller)", g_settings.invert_look ? L"On" : L"Off", nullptr,
-                         [](int) { g_settings.invert_look ^= 1; apply_settings(); }});
-        items.push_back({L"Invert mouse", g_settings.invert_mouse ? L"On" : L"Off", nullptr,
-                         [](int) { g_settings.invert_mouse ^= 1; apply_settings(); }});
-        items.push_back({L"Field of view", std::to_wstring(g_settings.fov), nullptr, adj(&g_settings.fov, 65, 120, 1)});
+        opt_page which = g_page == p_set_controls ? op_controls : g_page == p_set_video ? op_video : g_page == p_set_audio ? op_audio : op_access;
+        if (which == op_audio)
+        {
+            items.push_back({L"Master volume", pct(g_settings.master), nullptr, adj(&g_settings.master, 0, 100, 5)});
+            items.push_back({L"Music volume", pct(g_settings.music), nullptr, adj(&g_settings.music, 0, 100, 5)});
+            items.push_back({L"Effects volume", pct(g_settings.effects), nullptr, adj(&g_settings.effects, 0, 100, 5)});
+        }
+        if (which == op_controls)
+        {
+            items.push_back({L"Invert look (controller)", g_settings.invert_look ? L"On" : L"Off", nullptr,
+                             [](int) { g_settings.invert_look ^= 1; apply_settings(); }});
+            wchar_t sens[16];
+            swprintf(sens, 16, L"%.1f", g_settings.mouse);
+            items.push_back({L"Mouse sensitivity", sens, nullptr, [](int d) {
+                                 g_settings.mouse = std::max(0.1f, std::min(5.0f, g_settings.mouse + d * 0.1f));
+                                 apply_settings();
+                             }});
+            items.push_back({L"Invert mouse", g_settings.invert_mouse ? L"On" : L"Off", nullptr,
+                             [](int) { g_settings.invert_mouse ^= 1; apply_settings(); }});
+        }
+        if (which == op_video)
+            items.push_back({L"Field of view", std::to_wstring(g_settings.fov), nullptr, adj(&g_settings.fov, 65, 120, 1)});
+        for (const auto &o : k_options)
+        {
+            if (o.page != which) continue;
+            float v = opt_value(o);
+            std::wstring shown;
+            if (!o.names.empty()) shown = o.names[std::max(0, std::min((int)o.names.size() - 1, (int)v))];
+            else shown = std::to_wstring((int)std::lround(v)) + o.unit;
+            const opt_def *od = &o;
+            item i{o.label, shown, nullptr, [od](int d) {
+                       float x = opt_value(*od) + d * od->step;
+                       if (!od->names.empty() && od->hi - od->lo + 1 == (float)od->names.size())
+                       {
+                           // lists wrap around
+                           int n = (int)od->names.size();
+                           x = (float)((((int)x - (int)od->lo) % n + n) % n + (int)od->lo);
+                       }
+                       g_settings.opt[od->key] = std::max(od->lo, std::min(od->hi, x));
+                       apply_settings();
+                       save_settings();
+                   }};
+            i.note = o.note;
+            items.push_back(i);
+        }
+        if (which == op_controls)
         {
             const wchar_t *styles[] = {L"Auto", L"Xbox", L"PlayStation"};
             std::wstring v = styles[g_settings.button_style % 3];
@@ -3083,6 +6227,7 @@ static std::vector<item> build_items()
             b.note = L"How this menu names controller buttons";
             items.push_back(b);
         }
+        if (which == op_video)
         {
             item res{L"Resolution", resolution_name(g_settings.resolution), nullptr, [](int d) {
                          g_settings.resolution = (g_settings.resolution + d + k_resolution_count) % k_resolution_count;
@@ -3097,8 +6242,17 @@ static std::vector<item> build_items()
             win.note = L"Takes effect when Installation 08 next starts";
             items.push_back(win);
         }
+        items.push_back({L"Restore defaults", L"", [which] {
+                             for (const auto &o : k_options)
+                                 if (o.page == which) g_settings.opt.erase(o.key);
+                             if (which == op_audio) g_settings.master = g_settings.music = g_settings.effects = 100;
+                             if (which == op_controls) g_settings.invert_look = g_settings.invert_mouse = 0, g_settings.mouse = 1.0f;
+                             if (which == op_video) g_settings.fov = 78;
+                             apply_settings();
+                             save_settings();
+                         }, nullptr});
         for (auto &i : items)
-            if (!i.activate) { auto a = i.adjust; i.activate = [a] { a(1); }; }
+            if (!i.activate && i.adjust) { auto a = i.adjust; i.activate = [a] { a(1); }; }
         break;
     }
     case p_controls:
@@ -3176,6 +6330,19 @@ static std::vector<item> build_items()
 
 static void go_back()
 {
+    if (g_page == p_joined) lan::leave();
+    if (hosting_here(g_pick_game, g_page))
+    {
+        if (!lan::joined_names().empty())
+        {
+            g_confirm_title = L"CLOSE THE LAN GAME?";
+            g_confirm_note = L"The players who joined go back to their menus";
+            g_confirm_yes = [] { lan::host_close(); go_back_one(); };
+            go(p_confirm, 1);
+            return;
+        }
+        lan::host_close();
+    }
     if (!g_history.empty())
     {
         g_page = g_history.back().first, g_selected = g_history.back().second, g_scroll = 0;
@@ -3201,17 +6368,19 @@ static void update()
         now[a_accept] |= (p.wButtons & XINPUT_GAMEPAD_A) != 0;
         now[a_back] |= (p.wButtons & XINPUT_GAMEPAD_B) != 0;
         now[a_close] |= (p.wButtons & XINPUT_GAMEPAD_START) != 0;
+        now[a_delete] |= (p.wButtons & XINPUT_GAMEPAD_X) != 0;
     }
     bool focused = window_active();
     if (focused)
     {
         auto down = [](int vk) { return key_down(vk); };
-        now[a_up] |= down(VK_UP) || down('W');
-        now[a_down] |= down(VK_DOWN) || down('S');
-        now[a_left] |= down(VK_LEFT) || down('A');
-        now[a_right] |= down(VK_RIGHT) || down('D');
-        now[a_accept] |= down(VK_RETURN) || down(VK_SPACE);
-        now[a_back] |= down(VK_BACK);
+        bool typing = g_page == p_text; // letters are typed, not moves
+        now[a_up] |= down(VK_UP) || (down('W') && !typing);
+        now[a_down] |= down(VK_DOWN) || (down('S') && !typing);
+        now[a_left] |= down(VK_LEFT) || (down('A') && !typing);
+        now[a_right] |= down(VK_RIGHT) || (down('D') && !typing);
+        now[a_accept] |= down(VK_RETURN) || (down(VK_SPACE) && !typing);
+        now[a_back] |= down(VK_BACK) && g_page != p_ip && !typing;
         now[a_close] |= down(VK_ESCAPE);
     }
     DWORD t = GetTickCount();
@@ -3224,14 +6393,56 @@ static void update()
     }
     // In the launcher, Start/Esc is the same as Back.
     if (g_launcher && fire[a_close]) fire[a_back] = true, fire[a_close] = false;
+    // The splash: any button skips to its fade; nothing else happens until the menu shows.
+    if (splash_blocks_input())
+    {
+        int64_t since = (int64_t)GetTickCount64() - g_splash_start;
+        if ((fire[a_accept] || fire[a_back] || fire[a_close]) && since < k_splash_hold) g_splash_start -= k_splash_hold - since;
+        return;
+    }
+    // X (Square): delete a letter while typing a name or tag.
+    if (fire[a_delete] && g_page == p_text)
+    {
+        if (!g_text.empty()) g_text.pop_back();
+        return;
+    }
 
     std::vector<item> items = build_items();
     int n = (int)items.size();
     if (n == 0) { go_back(); return; }
-    if (fire[a_up]) g_selected = (g_selected + n - 1) % n;
-    if (fire[a_down]) g_selected = (g_selected + 1) % n;
     if (g_selected >= n) g_selected = n - 1;
     if (g_selected < 0) g_selected = 0;
+    // The main page: game tiles in a row (left and right), the other items in a bar below.
+    int tiles = 0;
+    while (tiles < n && !items[tiles].tile.empty()) tiles++;
+    if (tiles > 0 && tiles < n)
+    {
+        int bar = n - tiles;
+        if (g_selected < tiles)
+        {
+            if (fire[a_left] && g_selected > 0) g_selected--;
+            if (fire[a_right] && g_selected < tiles - 1) g_selected++;
+            if (fire[a_down]) g_last_tile = g_selected, g_selected = tiles + std::min(g_last_bar, bar - 1);
+        }
+        else
+        {
+            int b = g_selected - tiles;
+            if (fire[a_left]) b = (b + bar - 1) % bar;
+            if (fire[a_right]) b = (b + 1) % bar;
+            g_selected = tiles + b;
+            if (fire[a_up]) g_last_bar = b, g_selected = std::min(g_last_tile, tiles - 1);
+        }
+        fire[a_up] = fire[a_down] = fire[a_left] = fire[a_right] = false;
+    }
+    // Up and down skip section headings.
+    for (int dir : {fire[a_up] ? -1 : 0, fire[a_down] ? 1 : 0})
+        if (dir)
+            for (int k = 0; k < n; k++)
+            {
+                g_selected = (g_selected + dir + n) % n;
+                if (!items[g_selected].heading) break;
+            }
+    for (int k = 0; k < n && items[g_selected].heading; k++) g_selected = (g_selected + 1) % n;
 
     // Mouse: hover selects, left click activates, right click steps a value back.
     POINT pt;
@@ -3275,7 +6486,7 @@ static void update()
 static ID2D1Factory *g_d2d;
 static IDWriteFactory *g_dwrite;
 static ID2D1RenderTarget *g_rt;
-static IDWriteTextFormat *g_title_format, *g_item_format, *g_small_format, *g_value_format, *g_huge_format;
+static IDWriteTextFormat *g_title_format, *g_item_format, *g_small_format, *g_value_format, *g_huge_format, *g_tile_format;
 static float g_formats_scale;
 
 static IDWriteTextFormat *make_format(const wchar_t *family, float size, DWRITE_FONT_WEIGHT weight,
@@ -3317,16 +6528,17 @@ static bool ensure_target(IDXGISwapChain *chain, float scale)
     }
     if (g_dwrite && g_formats_scale != scale)
     {
-        for (auto f : {g_title_format, g_item_format, g_small_format, g_value_format, g_huge_format})
+        for (auto f : {g_title_format, g_item_format, g_small_format, g_value_format, g_huge_format, g_tile_format})
             if (f) f->Release();
         g_huge_format = make_format(L"Bahnschrift", 84 * scale, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_title_format = make_format(L"Bahnschrift", 56 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_item_format = make_format(L"Bahnschrift", 30 * scale, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_value_format = make_format(L"Bahnschrift", 30 * scale, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING);
         g_small_format = make_format(L"Bahnschrift", 22 * scale, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_tile_format = make_format(L"Bahnschrift", 32 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
         g_formats_scale = scale;
     }
-    return g_title_format && g_item_format && g_small_format && g_value_format && g_huge_format;
+    return g_title_format && g_item_format && g_small_format && g_value_format && g_huge_format && g_tile_format;
 }
 
 static void text(const std::wstring &s, IDWriteTextFormat *f, D2D1_RECT_F r, ID2D1Brush *b)
@@ -3345,6 +6557,11 @@ static std::wstring page_title()
     case p_main: return L"PAUSED";
     case p_missions: return L"SELECT MISSION";
     case p_settings: return L"SETTINGS";
+    case p_set_controls: return L"CONTROLS";
+    case p_set_video: return L"VIDEO";
+    case p_set_audio: return L"AUDIO";
+    case p_set_access: return L"ACCESSIBILITY";
+    case p_lobby: return L"LAN LOBBY";
     case p_quit: return L"QUIT TO DESKTOP?";
     case p_confirm: return g_confirm_title;
     case p_controls: return L"CONTROLS";
@@ -3354,31 +6571,73 @@ static std::wstring page_title()
     case p_forge: return L"FORGE";
     case p_pad: return L"CONTROLLER";
     case p_keys: return L"KEYBOARD AND MOUSE";
+    case p_lan: return L"LAN GAMES";
+    case p_ip: return L"JOIN BY IP ADDRESS";
+    case p_joined: return L"LAN GAME";
+    case p_look: return L"ARMOR AND COLORS";
+    case p_loadouts: return L"LOADOUTS";
+    case p_loadout: return L"LOADOUT " + std::to_wstring(g_loadout_edit + 1);
+    case p_text: return g_text_title;
     }
     return L"";
+}
+
+// A game's tile: two short lines of its name, and its colours (top, bottom).
+struct tile_look { const wchar_t *folder, *name; float top[3], bottom[3]; };
+static const tile_look &look_for(const std::wstring &folder)
+{
+    static const tile_look looks[] = {
+        {L"halo1", L"HALO\nCOMBAT EVOLVED", {0.24f, 0.42f, 0.30f}, {0.04f, 0.09f, 0.07f}},
+        {L"halo2", L"HALO 2", {0.20f, 0.33f, 0.56f}, {0.03f, 0.06f, 0.13f}},
+        {L"halo3", L"HALO 3", {0.56f, 0.41f, 0.17f}, {0.11f, 0.07f, 0.03f}},
+        {L"halo3odst", L"HALO 3\nODST", {0.38f, 0.40f, 0.45f}, {0.07f, 0.07f, 0.09f}},
+        {L"haloreach", L"HALO\nREACH", {0.55f, 0.22f, 0.19f}, {0.11f, 0.04f, 0.04f}},
+        {L"halo4", L"HALO 4", {0.16f, 0.45f, 0.52f}, {0.03f, 0.09f, 0.11f}},
+    };
+    static const tile_look other = {L"", L"", {0.3f, 0.32f, 0.36f}, {0.06f, 0.06f, 0.07f}};
+    for (const auto &l : looks)
+        if (!_wcsicmp(l.folder, folder.c_str())) return l;
+    return other;
+}
+
+static void fill_gradient(D2D1_RECT_F r, D2D1_COLOR_F a, D2D1_COLOR_F b)
+{
+    ID2D1GradientStopCollection *stops = nullptr;
+    D2D1_GRADIENT_STOP gs[2] = {{0.0f, a}, {1.0f, b}};
+    g_rt->CreateGradientStopCollection(gs, 2, &stops);
+    ID2D1LinearGradientBrush *br = nullptr;
+    if (stops)
+        g_rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(r.left, r.top), D2D1::Point2F(r.left, r.bottom)),
+                                        stops, &br);
+    if (br) g_rt->FillRectangle(r, br), br->Release();
+    if (stops) stops->Release();
 }
 
 static void draw(IDXGISwapChain *chain, bool opaque)
 {
     DXGI_SWAP_CHAIN_DESC sd;
     if (FAILED(chain->GetDesc(&sd))) return;
-    float w = (float)sd.BufferDesc.Width, h = (float)sd.BufferDesc.Height, s = h / 1080.0f;
+    float w = (float)sd.BufferDesc.Width, h = (float)sd.BufferDesc.Height;
+    float s = std::min(h / 1080.0f, w / 1600.0f); // fits narrow windows too
     if (!ensure_target(chain, s)) return;
 
-    ID2D1SolidColorBrush *white, *dim, *faint, *accent, *accent_fill, *shade, *panel;
+    ID2D1SolidColorBrush *white, *dim, *faint, *accent, *accent_fill, *shade, *panel, *line;
     g_rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 1), &white);
     g_rt->CreateSolidColorBrush(D2D1::ColorF(0.78f, 0.84f, 0.9f, 0.8f), &dim);
     g_rt->CreateSolidColorBrush(D2D1::ColorF(0.78f, 0.84f, 0.9f, 0.45f), &faint);
     g_rt->CreateSolidColorBrush(D2D1::ColorF(0.36f, 0.78f, 1.0f, 1), &accent);
-    g_rt->CreateSolidColorBrush(D2D1::ColorF(0.36f, 0.78f, 1.0f, 0.22f), &accent_fill);
-    g_rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.55f), &shade);
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(0.36f, 0.78f, 1.0f, 0.16f), &accent_fill);
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.6f), &shade);
     g_rt->CreateSolidColorBrush(D2D1::ColorF(0.02f, 0.06f, 0.1f, 0.6f), &panel);
+    g_rt->CreateSolidColorBrush(D2D1::ColorF(0.78f, 0.84f, 0.9f, 0.14f), &line);
 
     g_rt->BeginDraw();
-    float left = 140 * s, col = 760 * s, top = 170 * s;
+    float left = std::max(48 * s, std::min(140 * s, w * 0.07f));
+    float right = w - left;
+    float top = 120 * s;
     if (opaque || g_launcher)
     {
-        // The launcher's backdrop: a dark blue gradient with a faint horizon line.
+        // The backdrop: a dark blue gradient.
         ID2D1GradientStopCollection *stops = nullptr;
         D2D1_GRADIENT_STOP gs[3] = {{0.0f, D2D1::ColorF(0.03f, 0.07f, 0.12f, 1)},
                                     {0.6f, D2D1::ColorF(0.02f, 0.04f, 0.07f, 1)},
@@ -3390,103 +6649,233 @@ static void draw(IDXGISwapChain *chain, bool opaque)
                                             stops, &bg);
         if (bg) g_rt->FillRectangle(D2D1::RectF(0, 0, w, h), bg), bg->Release();
         if (stops) stops->Release();
-        if (g_launcher)
-        {
-            text(L"INSTALLATION 08", g_huge_format, D2D1::RectF(left, 60 * s, w - left, 170 * s), white);
-            text(L"The Master Chief Collection, offline  \u2022  version 1.1", g_small_format, D2D1::RectF(left + 4 * s, 160 * s, w - left, 195 * s), faint);
-            top = 240 * s;
-        }
     }
-    else
-    {
-        g_rt->FillRectangle(D2D1::RectF(0, 0, w, h), shade);
-    }
-
-    text(page_title(), g_title_format, D2D1::RectF(left, top, left + col + 400 * s, top + 70 * s), white);
-    std::wstring sub;
-    if (g_launcher)
-    {
-        if (g_page == p_setup) sub = L"";
-        else if (g_page == p_campaign || g_page == p_missions || g_page == p_pick) sub = g_pick_game ? g_pick_game->title : L"";
-        else if ((g_page == p_firefight || g_page == p_spops || g_page == p_custom || g_page == p_forge || g_page == p_controls ||
-                  g_page == p_pad || g_page == p_keys) && g_pick_game)
-            sub = g_pick_game->title;
-        else if (g_page == p_games) sub = L"";
-        else if ((g_page == p_controls || g_page == p_pad || g_page == p_keys) && g_pick_game) sub = g_pick_game->title;
-    }
-    else
-    {
-        const mission_entry *m = current_mission();
-        const game_entry *g = find_game(g_cfg.game);
-        sub = (g ? std::wstring(g->title) + L"  •  " : L"") + (m ? std::wstring(m->name) + L"  •  " : L"") +
-              difficulty_name(g_cfg.difficulty);
-    }
-    text(sub, g_small_format, D2D1::RectF(left, top + 70 * s, w - left, top + 105 * s), dim);
-    g_rt->FillRectangle(D2D1::RectF(left, top + 118 * s, left + col, top + 120 * s), accent);
+    else g_rt->FillRectangle(D2D1::RectF(0, 0, w, h), shade);
 
     std::vector<item> items = build_items();
-    float y0 = top + 145 * s, row = 54 * s;
-    int visible = std::max(3, (int)((h - 160 * s - y0) / (row + 4 * s)));
-    visible = std::min(visible, 24);
-    if (g_selected < g_scroll) g_scroll = g_selected;
-    if (g_selected >= g_scroll + visible) g_scroll = g_selected - visible + 1;
-    if (g_scroll > std::max(0, (int)items.size() - visible)) g_scroll = std::max(0, (int)items.size() - visible);
-    g_item_count = 0;
-    float y = y0;
-    for (int i = g_scroll; i < (int)items.size() && g_item_count < visible; i++)
-    {
-        float rh = items[i].note.empty() ? row : row + 26 * s;
-        D2D1_RECT_F r = D2D1::RectF(left, y, left + col, y + rh);
-        g_item_rects[g_item_count++] = r;
-        bool sel = i == g_selected;
-        if (sel)
-        {
-            g_rt->FillRectangle(r, accent_fill);
-            g_rt->FillRectangle(D2D1::RectF(left, y, left + 5 * s, y + rh), accent);
-        }
-        ID2D1Brush *label_brush = !items[i].enabled ? (ID2D1Brush *)faint : sel ? (ID2D1Brush *)white : (ID2D1Brush *)dim;
-        text(items[i].label, g_item_format, D2D1::RectF(left + 26 * s, y, left + col - 20 * s, y + row), label_brush);
-        if (!items[i].note.empty())
-            text(items[i].note, g_small_format, D2D1::RectF(left + 26 * s, y + row - 14 * s, left + col - 20 * s, y + rh - 6 * s), faint);
-        if (!items[i].value.empty())
-        {
-            std::wstring v = sel && items[i].adjust ? L"◂  " + items[i].value + L"  ▸" : items[i].value;
-            text(v, g_value_format, D2D1::RectF(left + 26 * s, y, left + col - 24 * s, y + row),
-                 sel ? (ID2D1Brush *)accent : (ID2D1Brush *)dim);
-        }
-        y += rh + 4 * s;
-    }
-    if (g_scroll > 0) text(L"▴", g_small_format, D2D1::RectF(left + col + 10 * s, y0, left + col + 40 * s, y0 + 30 * s), dim);
-    if (g_scroll + visible < (int)items.size()) text(L"▾", g_small_format, D2D1::RectF(left + col + 10 * s, y - 34 * s, left + col + 40 * s, y), dim);
+    int n = (int)items.size();
+    int tiles = 0;
+    while (tiles < n && !items[tiles].tile.empty()) tiles++;
+    bool tile_page = tiles > 0 && tiles < n;
 
-    // Objectives, as MCC shows them on its pause screen.
-    std::wstring primary, secondary;
+    // Header: the name on the main page; elsewhere the page's title, and where it is.
+    if (g_launcher && g_page == p_games)
     {
-        std::lock_guard<std::mutex> l(g_mission_lock);
-        primary = g_objective_primary, secondary = g_objective_secondary;
+        text(L"INSTALLATION 08", g_title_format, D2D1::RectF(left, 56 * s, right, 130 * s), white);
+        text(lan::status().empty() ? L"The Master Chief Collection, offline" : lan::status().substr(5), g_small_format,
+             D2D1::RectF(left + 2 * s, 128 * s, right, 160 * s), faint);
+        top = 200 * s;
     }
-    if (!g_launcher && g_page == p_main && (!primary.empty() || !secondary.empty()))
+    else
     {
-        float ox = left + col + 120 * s, ow = w - ox - 140 * s;
-        if (ow > 300 * s)
+        std::wstring sub;
+        if (g_launcher)
         {
-            g_rt->FillRectangle(D2D1::RectF(ox, top + 145 * s, ox + ow, top + 470 * s), panel);
-            text(L"OBJECTIVES", g_small_format, D2D1::RectF(ox + 30 * s, top + 160 * s, ox + ow, top + 200 * s), accent);
-            text(primary + (secondary.empty() ? L"" : L"\n\n" + secondary), g_item_format,
-                 D2D1::RectF(ox + 30 * s, top + 210 * s, ox + ow - 30 * s, top + 450 * s), white);
+            if (g_page != p_setup && g_page != p_games && g_page != p_lan && g_page != p_ip && g_page != p_joined &&
+                g_page != p_settings && g_page != p_set_controls && g_page != p_set_video && g_page != p_set_audio &&
+                g_page != p_set_access && g_page != p_quit && g_page != p_confirm && g_pick_game)
+                sub = g_pick_game->title;
+            if (g_page == p_lan || g_page == p_joined || g_page == p_ip) sub = lan::status().empty() ? L"" : lan::status().substr(5);
         }
+        else
+        {
+            const mission_entry *m = current_mission();
+            const game_entry *g = find_game(g_cfg.game);
+            sub = (g ? std::wstring(g->title) : L"") + (m && g_mode == 1 ? L"  •  " + std::wstring(m->name) : L"") +
+                  (g_mode != 3 ? L"  •  " + std::wstring(difficulty_name(g_cfg.difficulty)) : L"");
+        }
+        text(sub, g_small_format, D2D1::RectF(left, 60 * s, right, 92 * s), faint);
+        text(page_title(), g_title_format, D2D1::RectF(left, 88 * s, right, 160 * s), white);
+        top = 190 * s;
     }
 
-    std::wstring hints = g_launcher ? std::wstring(btn(L"A")) + L" / Enter  select      " + btn(L"B") + L" / Esc  back"
-                                    : std::wstring(btn(L"A")) + L" / Enter  select      " + btn(L"B") + L" / Backspace  back      " +
-                                          btn(L"Start") + L" / Esc  resume";
-    if (g_selected < (int)items.size() && items[g_selected].adjust) hints += L"      ◂ ▸  change";
-    if (g_listen_kind == listen_pad) hints = std::wstring(L"Press the button to use      ") + btn(L"Start") + L" / Esc  cancel";
+    // Footer: what the selected item does, then the buttons.
+    float foot = h - 120 * s;
+    g_rt->FillRectangle(D2D1::RectF(left, foot, right, foot + 1.5f * s), line);
+    std::wstring hints = g_launcher ? std::wstring(btn(L"A")) + L"  select      " + btn(L"B") + L"  back"
+                                    : std::wstring(btn(L"A")) + L"  select      " + btn(L"B") + L"  back      " + btn(L"Start") + L"  resume";
+    if (g_page == p_text) hints += std::wstring(L"      ") + btn(L"X") + L"  delete";
+    if (g_selected < n && items[g_selected].adjust) hints += L"      ◂ ▸  change";
+    if (g_listen_kind == listen_pad) hints = std::wstring(L"Press the button to use      ") + btn(L"Start") + L"  cancel";
     if (g_listen_kind == listen_key) hints = std::wstring(L"Press the key or mouse button to use      Esc / ") + btn(L"B") + L"  cancel";
-    text(hints, g_small_format, D2D1::RectF(left, h - 110 * s, w - left, h - 70 * s), dim);
+    text(hints, g_small_format, D2D1::RectF(left, foot + 20 * s, right, foot + 60 * s), dim);
+    if (g_selected < n && (!tile_page || g_selected >= tiles))
+        text(items[g_selected].note, g_small_format, D2D1::RectF(left, foot - 50 * s, right, foot - 12 * s), dim);
+
+    for (auto &r : g_item_rects) r = D2D1::RectF(-1, -1, -1, -1);
+    if (tile_page)
+    {
+        // Tiles, scrolled so the selected one shows.
+        g_scroll = 0;
+        float area = foot - 70 * s - top;
+        float gap = 22 * s;
+        float th = std::min(440 * s, area * 0.62f), tw = th * 0.72f;
+        // All the games in one row when they fit at a reasonable size.
+        float all = (right - left - (tiles - 1) * gap) / tiles;
+        if (all < tw && all >= 170 * s) tw = all, th = tw / 0.72f;
+        int fit = std::max(1, (int)((right - left + gap) / (tw + gap)));
+        int sel_tile = g_selected < tiles ? g_selected : std::min(g_last_tile, tiles - 1);
+        if (sel_tile < g_tile_scroll) g_tile_scroll = sel_tile;
+        if (sel_tile >= g_tile_scroll + fit) g_tile_scroll = sel_tile - fit + 1;
+        g_tile_scroll = std::max(0, std::min(g_tile_scroll, std::max(0, tiles - fit)));
+        float y = top + 20 * s;
+        for (int i = g_tile_scroll; i < tiles && i < g_tile_scroll + fit; i++)
+        {
+            float x = left + (i - g_tile_scroll) * (tw + gap);
+            D2D1_RECT_F r = D2D1::RectF(x, y, x + tw, y + th);
+            g_item_rects[i] = r;
+            const tile_look &lk = look_for(items[i].tile);
+            fill_gradient(r, D2D1::ColorF(lk.top[0], lk.top[1], lk.top[2], 1), D2D1::ColorF(lk.bottom[0], lk.bottom[1], lk.bottom[2], 1));
+            bool sel = i == g_selected;
+            if (!sel) g_rt->FillRectangle(r, shade);
+            text(lk.name, g_tile_format, D2D1::RectF(x + 20 * s, y + th - 120 * s, x + tw - 12 * s, y + th - 18 * s),
+                 sel ? (ID2D1Brush *)white : (ID2D1Brush *)dim);
+            if (sel) g_rt->DrawRectangle(D2D1::RectF(r.left + 1.5f * s, r.top + 1.5f * s, r.right - 1.5f * s, r.bottom - 1.5f * s), accent, 3 * s);
+        }
+        if (g_tile_scroll > 0) text(L"‹", g_title_format, D2D1::RectF(left - 40 * s, y, left - 4 * s, y + th), dim);
+        if (g_tile_scroll + fit < tiles) text(L"›", g_title_format, D2D1::RectF(right + 8 * s, y, right + 44 * s, y + th), dim);
+        // The game under the selection: its name and what it has.
+        float ty = y + th + 24 * s;
+        text(items[sel_tile].label, g_item_format, D2D1::RectF(left, ty, right, ty + 44 * s),
+             g_selected < tiles ? (ID2D1Brush *)white : (ID2D1Brush *)dim);
+        text(items[sel_tile].note, g_small_format, D2D1::RectF(left, ty + 42 * s, right, ty + 74 * s), faint);
+        // The bar: LAN games, Settings, Quit.
+        float by = std::min(foot - 100 * s, ty + 150 * s), bx = left;
+        for (int i = tiles; i < n; i++)
+        {
+            IDWriteTextLayout *layout = nullptr;
+            g_dwrite->CreateTextLayout(items[i].label.c_str(), (UINT32)items[i].label.size(), g_item_format, 2000 * s, 50 * s, &layout);
+            float tw2 = 120 * s;
+            if (layout)
+            {
+                DWRITE_TEXT_METRICS m;
+                if (SUCCEEDED(layout->GetMetrics(&m))) tw2 = m.width;
+                layout->Release();
+            }
+            D2D1_RECT_F r = D2D1::RectF(bx, by, bx + tw2, by + 44 * s);
+            g_item_rects[i] = D2D1::RectF(r.left - 10 * s, r.top, r.right + 10 * s, r.bottom + 8 * s);
+            bool sel = i == g_selected;
+            text(items[i].label, g_item_format, r, sel ? (ID2D1Brush *)white : (ID2D1Brush *)dim);
+            if (sel) g_rt->FillRectangle(D2D1::RectF(r.left, r.bottom + 2 * s, r.right, r.bottom + 5 * s), accent);
+            bx += tw2 + 56 * s;
+        }
+        g_item_count = std::min(n, 32);
+    }
+    else
+    {
+        // A list: one line per item, a value on the right; scrolls when long.
+        float col = std::min(right - left, 900 * s);
+        float row = 56 * s, gap = 4 * s;
+        float y0 = top + 10 * s, bottom = foot - 60 * s;
+        auto height = [&](int i) { return items[i].heading ? 44 * s : row; };
+        if (g_selected < g_scroll) g_scroll = g_selected;
+        // (headings above the selection come into view with it)
+        while (g_scroll > 0 && items[g_scroll - 1].heading && g_scroll - 1 <= g_selected) g_scroll--;
+        for (;;)
+        {
+            float used = 0;
+            for (int i = g_scroll; i <= g_selected && i < n; i++) used += height(i) + gap;
+            if (used <= bottom - y0 || g_scroll >= g_selected) break;
+            g_scroll++;
+        }
+        g_item_count = 0;
+        float y = y0;
+        int last = g_scroll;
+        for (int i = g_scroll; i < n; i++)
+        {
+            float rh = height(i);
+            if (y + rh > bottom) break;
+            last = i;
+            D2D1_RECT_F r = D2D1::RectF(left, y, left + col, y + rh);
+            if (g_item_count < 32) g_item_rects[g_item_count++] = r;
+            if (items[i].heading)
+            {
+                text(items[i].label, g_small_format, D2D1::RectF(left + 26 * s, y + 10 * s, left + col, y + rh), accent);
+                y += rh + gap;
+                continue;
+            }
+            bool sel = i == g_selected;
+            if (sel)
+            {
+                g_rt->FillRectangle(r, accent_fill);
+                g_rt->FillRectangle(D2D1::RectF(left, y, left + 4 * s, y + rh), accent);
+            }
+            ID2D1Brush *label_brush = !items[i].enabled ? (ID2D1Brush *)faint : sel ? (ID2D1Brush *)white : (ID2D1Brush *)dim;
+            text(items[i].label, g_item_format, D2D1::RectF(left + 26 * s, y, left + col - 20 * s, y + rh), label_brush);
+            if (!items[i].value.empty())
+            {
+                std::wstring v = sel && items[i].adjust ? L"◂  " + items[i].value + L"  ▸" : items[i].value;
+                text(v, g_value_format, D2D1::RectF(left + 26 * s, y, left + col - 24 * s, y + rh),
+                     sel ? (ID2D1Brush *)accent : (ID2D1Brush *)dim);
+            }
+            y += rh + gap;
+        }
+        if (g_scroll > 0) text(L"▴", g_small_format, D2D1::RectF(left + col + 10 * s, y0, left + col + 40 * s, y0 + 30 * s), dim);
+        if (last < n - 1) text(L"▾", g_small_format, D2D1::RectF(left + col + 10 * s, y - 34 * s, left + col + 40 * s, y), dim);
+
+        // Objectives, as MCC shows them on its pause screen.
+        std::wstring primary, secondary;
+        {
+            std::lock_guard<std::mutex> l(g_mission_lock);
+            primary = g_objective_primary, secondary = g_objective_secondary;
+        }
+        if (!g_launcher && g_page == p_main && (!primary.empty() || !secondary.empty()))
+        {
+            float ox = left + col + 100 * s, ow = right - ox;
+            if (ow > 300 * s)
+            {
+                g_rt->FillRectangle(D2D1::RectF(ox, y0, ox + ow, y0 + 320 * s), panel);
+                text(L"OBJECTIVES", g_small_format, D2D1::RectF(ox + 30 * s, y0 + 15 * s, ox + ow, y0 + 55 * s), accent);
+                text(primary + (secondary.empty() ? L"" : L"\n\n" + secondary), g_small_format,
+                     D2D1::RectF(ox + 30 * s, y0 + 65 * s, ox + ow - 30 * s, y0 + 300 * s), white);
+            }
+        }
+    }
+
+    // The player's name, top right, in the launcher (once it's been asked).
+    if (g_launcher && g_page != p_text && g_settings.name_asked && !lan::g_name.empty())
+    {
+        text(lan::widen(lan::g_name), g_value_format, D2D1::RectF(left, 66 * s, right, 110 * s), white);
+        if (!g_settings.service_tag.empty())
+        {
+            g_small_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            text(lan::widen(g_settings.service_tag), g_small_format, D2D1::RectF(left, 106 * s, right, 136 * s), faint);
+            g_small_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+    }
+
+    // The splash: the name alone, then it fades out and the menu fades in.
+    if (g_launcher && g_splash_start)
+    {
+        int64_t t = (int64_t)GetTickCount64() - g_splash_start;
+        if (t >= k_splash_hold + k_splash_out + k_splash_in) g_splash_start = 0;
+        else
+        {
+            float cover = t < k_splash_hold + k_splash_out ? 1.0f : 1.0f - (float)(t - k_splash_hold - k_splash_out) / k_splash_in;
+            float a = t < 400 ? t / 400.0f : t < k_splash_hold ? 1.0f : t < k_splash_hold + k_splash_out ? 1.0f - (float)(t - k_splash_hold) / k_splash_out : 0.0f;
+            ID2D1SolidColorBrush *black = nullptr, *ink = nullptr, *bar = nullptr;
+            g_rt->CreateSolidColorBrush(D2D1::ColorF(0.01f, 0.02f, 0.04f, cover), &black);
+            g_rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, a), &ink);
+            g_rt->CreateSolidColorBrush(D2D1::ColorF(0.36f, 0.78f, 1.0f, a), &bar);
+            if (black) g_rt->FillRectangle(D2D1::RectF(0, 0, w, h), black);
+            if (a > 0 && ink && bar)
+            {
+                float cy = h / 2;
+                // The accent line grows out from the middle as the name appears.
+                float grow = std::min(1.0f, t / 700.0f);
+                float half = 220 * s * (1 - (1 - grow) * (1 - grow));
+                g_huge_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                text(L"INSTALLATION 08", g_huge_format, D2D1::RectF(0, cy - 110 * s, w, cy - 10 * s), ink);
+                g_rt->FillRectangle(D2D1::RectF(w / 2 - half, cy + 6 * s, w / 2 + half, cy + 9 * s), bar);
+                g_huge_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            }
+            for (auto b : {black, ink, bar})
+                if (b) b->Release();
+        }
+    }
 
     HRESULT hr = g_rt->EndDraw();
-    for (auto b : {white, dim, faint, accent, accent_fill, shade, panel}) b->Release();
+    for (auto b : {white, dim, faint, accent, accent_fill, shade, panel, line}) b->Release();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) g_rt->Release(), g_rt = nullptr;
 }
 
@@ -3582,6 +6971,7 @@ static bool loading_visible(float *alpha, float *progress, bool *busy)
 {
     int64_t t = now_ms();
     *busy = false;
+    if (!g_loading_screen) return false;
     if (g_ending)
     {
         *alpha = 1, *progress = 0, *busy = true;
@@ -3794,6 +7184,20 @@ static uint32_t h_chud_blend_color(void *, int player, uint32_t argb)
 // the classic graphics and Back doesn't switch.
 static bool h_graphics_switch_on_back(void *) { return g_module == 1 && g_local_players <= 1; }
 
+// Split-screen view values the games ask for (MCC-Win64-Shipping.exe host functions
+// #84-#86 return these constants; a generic stub would leave the float register as junk).
+static float h_splitscreen_84(void *, int n)
+{
+    static const float v[4] = {-0.38f, -0.58f, -0.79f, -1.0f};
+    return n >= 0 && n < 4 ? v[n] : 0.0f;
+}
+static float h_splitscreen_85(void *, int n)
+{
+    static const float v[4] = {0.76666665f, 0.6666667f, 0.5882353f, 0.5f};
+    return n >= 0 && n < 4 ? v[n] : 1.0f;
+}
+static float h_splitscreen_86(void *) { return 0.2f; }
+
 static void build_host_vtable()
 {
     fill_stubs<k_tag_host>(g_host_vtable, std::make_index_sequence<512>{});
@@ -3802,6 +7206,9 @@ static void build_host_vtable()
     g_event_vtable[147] = (void *)&e_get_guid;
     void **v = g_host_vtable;
     v[0] = (void *)&h_begin_frame;
+    v[84] = (void *)&h_splitscreen_84;
+    v[85] = (void *)&h_splitscreen_85;
+    v[86] = (void *)&h_splitscreen_86;
     v[1] = (void *)&h_end_frame;
     v[3] = (void *)&h_set_game_state;
     v[4] = (void *)&h_restart_game;
@@ -3809,6 +7216,9 @@ static void build_host_vtable()
     v[42] = (void *)&h_network_sendto_reliable;
     v[43] = (void *)&h_network_recvfrom;
     v[5] = (void *)&h_save_game;
+    v[12] = (void *)&h_set_scenario_map_variant;
+    v[14] = (void *)&h_set_player_look_control;
+    v[15] = (void *)&h_set_player_profile_game_specific;
     v[7] = (void *)&h_pause_game;
     v[9] = (void *)&h_set_game_objectives;
     v[10] = (void *)&h_get_game_event_manager;
@@ -3928,6 +7338,8 @@ static void list_folder(const std::wstring &pattern)
 
 static HMODULE g_game_module;
 // ---------------------------------------------------------------- crashes
+static DWORD g_main_thread;
+static std::wstring g_lan_arg; // --lan host | --lan <host address>
 static LONG WINAPI on_crash(EXCEPTION_POINTERS *info);
 static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
 {
@@ -3939,16 +7351,23 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *info)
     CONTEXT *c = info->ContextRecord;
     logf("  rax=%llx rbx=%llx rcx=%llx rdx=%llx r8=%llx r9=%llx rsp=%llx", c->Rax, c->Rbx, c->Rcx, c->Rdx, c->R8,
          c->R9, c->Rsp);
+    logf("  thread %lu%s", GetCurrentThreadId(), GetCurrentThreadId() == g_main_thread ? " (Installation 08's main thread)" : "");
+    // Code addresses on the stack: the callers, among other things. Large frames (DXVK's)
+    // push the callers far down, so look a long way.
     uint64_t *stack = reinterpret_cast<uint64_t *>(c->Rsp);
-    for (int i = 0; i < 48; i++)
+    int shown = 0;
+    for (int i = 0; i < 2048 && shown < 40; i++)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery((void *)stack[i], &mbi, sizeof(mbi)) || mbi.Type != MEM_IMAGE) continue;
+        if (IsBadReadPtr(&stack[i], 8)) break;
+        if (!VirtualQuery((void *)stack[i], &mbi, sizeof(mbi)) || mbi.Type != MEM_IMAGE || !(mbi.Protect & 0xF0)) continue;
         logf("  stack[%d] %s", i, module_offset((void *)stack[i]).c_str());
+        shown++;
     }
     log_flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
 
 // ---------------------------------------------------------------- window
 // The mouse is captured (hidden and kept in the window) after a click in the window,
@@ -4041,6 +7460,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
         if (wp == VK_F8) capture_mouse(hwnd, false);
         break;
+    case WM_CHAR:
+        menu::on_char((wchar_t)wp);
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -4196,6 +7618,7 @@ static next_action run_launcher()
     while (g_next.kind == next_action::k_none)
     {
         pump_messages();
+        lan::poll(false);
         if (IsIconic(g_hwnd)) { Sleep(50); continue; }
         menu::on_idle(); // draws and presents, paced by the display
     }
@@ -4256,6 +7679,18 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
     g_keyboard_player = g_settings.keyboard_player != 0;
     net_reset();
     g_ff_variant = what.variant;
+    {
+        std::lock_guard<std::mutex> l(g_forge_lock);
+        g_map_variant_path = what.map_variant;
+        g_forge_status.clear();
+    }
+    g_forge_save = 0;
+    {
+        const game_entry *e = find_game(what.game);
+        if (e) g_module = e->module;
+    }
+    lan::host_game_starting(what);
+    lan::set_playing(true);
     const game_entry *entry = find_game(g_cfg.game);
     if (entry)
     {
@@ -4323,6 +7758,8 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
     if (!g_engine) return back_to_launcher;
     load_campaign_info();
     apply_settings();
+    apply_look(narrow(g_cfg.game.c_str()), g_module);
+    load_game_data(g_cfg.game);
     logf("engine.initialize_graphics ...");
     g_engine->initialize_graphics(device, context, g_swapchain, nullptr);
     logf("engine.initialize_graphics returned");
@@ -4337,12 +7774,14 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
     // Halo 2: flag 1 starts the Anniversary graphics; without it the game starts classic.
     // (Anniversary graphics are a campaign thing; multiplayer runs the classic engine.)
     bool split = what.players > 1;
-    if (g_module == 1 && !g_settings.h2_classic && g_mode == 1 && !split) options.flags |= 1;
+    int h1_classic = what.classic >= 0 ? what.classic : g_settings.h1_classic;
+    int h2_classic = what.classic >= 0 ? what.classic : g_settings.h2_classic;
+    if (g_module == 1 && !h2_classic && g_mode == 1 && !split) options.flags |= 1;
     use_controls(narrow(g_cfg.game.c_str()), g_module);
     // Halo CE reads the same two bits into its config: bit 0 clear sets CONFIG.LegacyMode
     // (classic graphics), bit 1 clear sets CONFIG.LegacySounds (classic sound). MCC's
     // default is the remastered sound, so that bit is always on.
-    if (g_module == 0) options.flags |= 2 | (g_settings.h1_classic || g_mode != 1 ? 0 : 1);
+    if (g_module == 0) options.flags |= 2 | (h1_classic || g_mode != 1 ? 0 : 1);
     options.game_tick = (char)g_cfg.tick;
     options.game_mode = 1;
     // Halo 2 picks its engine from this field: a campaign map id (29-43) gets the
@@ -4374,7 +7813,55 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         players.address[0] = g_cfg.address;
         for (int i = 0; i < g_local_players; i++) players.player_options[i].address = g_cfg.address;
     }
-    players.unknown_2 = -1;
+    // LAN play: everyone's machine and player, host first, the same on every machine;
+    // only the host has flag 8. un_3 is the server to join: Halo CE's client reads it
+    // when flag 8 is clear (halo1.dll+0x93c71) and sends its join requests there.
+    if (!lan::g_seats.empty())
+    {
+        int n = (int)std::min<size_t>(lan::g_seats.size(), 16);
+        players.player_count = n;
+        players.peer_count = n;
+        for (int i = 0; i < n; i++)
+        {
+            players.player_options[i] = {lan::g_seats[i].xuid, lan::g_seats[i].address, -1, 0, -1, -1};
+            players.address[i] = lan::g_seats[i].address;
+        }
+        if (g_module == 0)
+        {
+            // Halo CE (tested this way): both fields hold the server's address.
+            options.host_address = (int64_t)lan::g_seats[0].address;
+            options.un_3 = (int64_t)lan::g_seats[0].address;
+        }
+        else
+        {
+            // As MCC fills them in (MCC-Win64-Shipping.exe+0x46be1f..0x46c25d):
+            //  +0x50  the session's id, the same on every machine
+            //  +0x58  this machine's own address (Halo 3 takes it as its network identity)
+            //  +0x2f8 the host's address, on the other machines only
+            //  each player's unknown_4 is its machine's index in the address list, and the
+            //  list's unknown_2 is this machine's index.
+            int me = 0;
+            for (int i = 0; i < n; i++)
+            {
+                players.player_options[i].unknown_4 = i;
+                if (lan::g_seats[i].address == lan::g_my_id) me = i;
+            }
+            players.unknown_2 = me;
+            options.un_2 = (int64_t)(lan::g_seats[0].address ^ 0x4930384C414E0001ull);
+            options.host_address = (int64_t)lan::g_my_id;
+            options.un_3 = lan::g_role == lan::k_host ? 0 : (int64_t)lan::g_seats[0].address;
+        }
+        if (lan::g_role == lan::k_host) options.flags |= 8;
+        else options.flags &= ~8;
+        g_local_players = 1;
+        std::string list;
+        for (int i = 0; i < n; i++)
+            list += (i ? ", " : "") + std::to_string(i) + ": xuid " + std::to_string(lan::g_seats[i].xuid & 0xFFFF) + " at " +
+                    std::to_string(lan::g_seats[i].address & 0xFFFF);
+        logf("lan: %s a game for %d machines (%s), flags %x", lan::g_role == lan::k_host ? "hosting" : "joining", n, list.c_str(),
+             (unsigned)(uint16_t)options.flags);
+    }
+    if (lan::g_seats.empty() || g_module == 0) players.unknown_2 = -1;
 
     // Firefight: the same launch with mode 5, plus a game type (a file in
     // game_variants) and the map's built-in variant, both made by the game's own loader.
@@ -4400,7 +7887,23 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
             fclose(f);
         }
         i_saved_game_file *game_type = (data && !file.empty()) ? data->game_variant_from_file(file.data(), (uint32_t)file.size()) : nullptr;
-        i_saved_game_file *map = data ? data->map_variant_from_map_id(&options.map_id) : nullptr;
+        i_saved_game_file *map = nullptr;
+        // A saved Forge map, or the map as it comes.
+        if (data && !what.map_variant.empty())
+        {
+            std::string bytes = read_file(what.map_variant);
+            if (!bytes.empty()) map = data->map_variant_from_file(bytes.data(), (uint32_t)bytes.size());
+            const int32_t *id = map ? static_cast<i_scenario_map_variant *>(map)->get_map_id() : nullptr;
+            logf("map variant %s (%zu bytes) -> %p, its map %d (playing on %d)", narrow(what.map_variant.c_str()).c_str(),
+                 bytes.size(), (void *)map, id ? *id : -1, g_cfg.map);
+            if (!map)
+            {
+                logf("the saved map could not be read; playing the map as it comes");
+                std::lock_guard<std::mutex> l(g_forge_lock);
+                g_map_variant_path.clear();
+            }
+        }
+        if (!map && data) map = data->map_variant_from_map_id(&options.map_id);
         logf("firefight: data access %p, game type %s (%zu bytes) -> %p \"%s\", map %d -> %p", (void *)data,
              narrow(path.c_str()).c_str(), file.size(), (void *)game_type,
              game_type && game_type->get_name() ? narrow(game_type->get_name()).c_str() : "", g_cfg.map, (void *)map);
@@ -4414,13 +7917,38 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         options.game_mode = g_mode;
     }
 
+    // LAN co-op (campaign): a networked game checks the map variant in the options,
+    // which a solo campaign never fills. The map's own variant, as for Firefight.
+    if (g_mode == 1 && !lan::g_seats.empty())
+    {
+        auto create_data_access = (t_create_data_access)GetProcAddress(module, "CreateDataAccess");
+        i_data_access *data = nullptr;
+        if (create_data_access) create_data_access(&data);
+        i_saved_game_file *map = data ? data->map_variant_from_map_id(&options.map_id) : nullptr;
+        logf("lan co-op: map variant for map %d -> %p", g_cfg.map, (void *)map);
+        if (map) map->copy_to_game_options(&options);
+    }
+
     // Continuing: the saved state goes back to the game the way MCC passes it, its
     // size just before the pointer (Reach checks for exactly its 10.9 MB state).
     static std::vector<char> resume_state;
     resume_state.clear();
-    if (what.resume)
+    if (what.resume && !lan::g_seats.empty())
     {
-        if (FILE *f = _wfopen(save_path(g_cfg.game).c_str(), L"rb"))
+        // Co-op continue: the same saved game on every machine (lan::host_game_starting
+        // read it on the host and sent it; a client received it).
+        resume_state.assign(lan::g_resume_data.begin(), lan::g_resume_data.end());
+        if (!resume_state.empty())
+        {
+            options.un_6 = (int32_t)resume_state.size();
+            options.saved_game_state = resume_state.data();
+            logf("continuing the co-op saved game (%zu bytes)", resume_state.size());
+        }
+        else logf("starting the co-op mission from its beginning");
+    }
+    else if (what.resume)
+    {
+        if (FILE *f = _wfopen((what.coop ? coop_save_path(g_cfg.game) : save_path(g_cfg.game)).c_str(), L"rb"))
         {
             fseek(f, 0, SEEK_END);
             long size = ftell(f);
@@ -4441,6 +7969,7 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         else logf("could not read the saved game; starting the mission");
     }
 
+    g_game_run++;
     logf("engine.initialize_game ...");
     HANDLE game_thread = g_engine->initialize_game(&g_host, &options);
     logf("engine.initialize_game -> thread handle %p", (void *)game_thread);
@@ -4454,6 +7983,8 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         DWORD w = game_thread ? MsgWaitForMultipleObjects(1, &game_thread, FALSE, 30, QS_ALLINPUT)
                               : MsgWaitForMultipleObjects(0, nullptr, FALSE, 30, QS_ALLINPUT);
         if (game_thread && w == WAIT_OBJECT_0) { logf("game thread ended"); break; }
+        lan::poll(true);
+        keep_game_changes();
         menu::on_idle();
         pump_messages();
         if (g_next.kind != next_action::k_none && !g_ending)
@@ -4464,6 +7995,17 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
             logf("asking the game to end");
             g_engine->post_message(1, nullptr); // resume, if paused
             g_engine->post_message(13, nullptr);
+        }
+        // The game ended by itself (the mission or co-op session is over, or the host
+        // left a LAN game): nothing asked it to, so treat it as asked. Halo 3, Halo 4 and
+        // Reach end their thread on their own before this; Halo 2 waits for the engine
+        // to be released below, and without this it waited forever.
+        if (!g_ending && g_game_over_at && (int64_t)GetTickCount64() - g_game_over_at > 3000)
+        {
+            logf("the game ended by itself; going back to the launcher");
+            g_ending = true;
+            g_ending_since = (int64_t)GetTickCount64();
+            menu::g_open = false;
         }
         // Halo 2 reports that it has ended but keeps its threads running until the host
         // releases the engine (MCC does this next); Reach's thread ends by itself first.
@@ -4488,6 +8030,10 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         }
     }
     KillTimer(g_hwnd, 1);
+    keep_game_changes();
+    lan::log_totals();
+    lan::game_ended();
+    lan::set_playing(false);
     next_action result = g_next;
     if (result.kind == next_action::k_none) result = back_to_launcher; // the game ended by itself (campaign over)
     if (g_discard_session.exchange(false)) put_back_save_from_before();
@@ -4511,6 +8057,45 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
     if (!engine_released) g_engine->free();
     g_engine = nullptr;
     g_game_module = nullptr;
+    // Let the graphics driver finish with everything the game drew and let go of what
+    // it made before its code goes away: some of the game's objects are released by the
+    // driver later (on the PS5, after the unload, which crashed the launcher).
+    if (context)
+    {
+        context->ClearState();
+        // Two blank frames: the PS5's graphics layer (DXVK) lets go of what a game
+        // released at the end of a frame. Halo 4 attaches objects of its own to its
+        // buffers (as private data), released then; after the DLL is gone that crashed.
+        if (g_swapchain)
+            for (int i = 0; i < 2; i++)
+            {
+                ID3D11Texture2D *back = nullptr;
+                if (SUCCEEDED(g_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back)) && back)
+                {
+                    ID3D11RenderTargetView *rtv = nullptr;
+                    if (device && SUCCEEDED(device->CreateRenderTargetView(back, nullptr, &rtv)) && rtv)
+                    {
+                        const float black[4] = {0, 0, 0, 1};
+                        context->ClearRenderTargetView(rtv, black);
+                        rtv->Release();
+                    }
+                    back->Release();
+                }
+                g_swapchain->Present(0, 0);
+            }
+        context->ClearState();
+        context->Flush();
+        D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+        ID3D11Query *done = nullptr;
+        if (device && SUCCEEDED(device->CreateQuery(&qd, &done)))
+        {
+            context->End(done);
+            context->Flush();
+            BOOL finished = FALSE;
+            for (int i = 0; i < 400 && context->GetData(done, &finished, sizeof(finished), 0) != S_OK; i++) Sleep(5);
+            done->Release();
+        }
+    }
     HANDLE unloader = CreateThread(nullptr, 0, free_library_thread, module, 0, nullptr);
     if (WaitForSingleObject(unloader, 15000) != WAIT_OBJECT_0)
     {
@@ -4529,6 +8114,53 @@ static next_action run_game(const next_action &what, ID3D11Device *device, ID3D1
         ask_to_be_restarted();
     }
     return result;
+}
+
+// Before ending the process: let the graphics driver finish this process's work and
+// let go of the window and swap chain, so the next start does not wait on them.
+static void release_graphics(ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    if (g_hwnd) ShowWindow(g_hwnd, SW_HIDE);
+    if (menu::g_rt) menu::g_rt->Release(), menu::g_rt = nullptr;
+    if (context)
+    {
+        context->ClearState();
+        context->Flush();
+        D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+        ID3D11Query *done = nullptr;
+        if (device && SUCCEEDED(device->CreateQuery(&qd, &done)))
+        {
+            context->End(done);
+            BOOL finished = FALSE;
+            for (int i = 0; i < 200 && context->GetData(done, &finished, sizeof(finished), 0) != S_OK; i++) Sleep(5);
+            done->Release();
+        }
+    }
+    if (g_swapchain) g_swapchain->Release(), g_swapchain = nullptr;
+    if (context) context->Release();
+    if (device) device->Release();
+    if (g_hwnd) DestroyWindow(g_hwnd), g_hwnd = nullptr;
+    logf("graphics released");
+}
+
+// Another Installation 08 still running (or still closing): worth knowing about.
+static void note_other_instances()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe = {sizeof(pe)};
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+        if (pe.th32ProcessID != GetCurrentProcessId() && !_wcsicmp(pe.szExeFile, L"installation08.exe"))
+        {
+            logf("another installation08.exe is still running (process %lu); waiting for it to close", (unsigned long)pe.th32ProcessID);
+            if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pe.th32ProcessID))
+            {
+                DWORD w = WaitForSingleObject(h, 15000);
+                logf("  %s", w == WAIT_OBJECT_0 ? "it closed" : "it is still there; carrying on");
+                CloseHandle(h);
+            }
+        }
+    CloseHandle(snap);
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -4560,7 +8192,6 @@ int wmain(int argc, wchar_t **argv)
         else if (k == L"--map") g_cfg.map = _wtoi(v);
         else if (k == L"--map-file") g_cfg.map_file = v;
         else if (k == L"--preload") g_cfg.preload = _wtoi(v);
-        else if (k == L"--watchdog") g_cfg.watchdog = _wtoi(v);
         else if (k == L"--auto-resume") g_cfg.auto_resume = _wtoi(v);
         else if (k == L"--monitor") g_cfg.monitor = _wtoi(v);
         else if (k == L"--pad-mapping") g_cfg.pad_mapping = _wtoi(v);
@@ -4568,6 +8199,9 @@ int wmain(int argc, wchar_t **argv)
             g_cfg.volume = (float)_wtof(v), g_settings.master = g_settings.music = g_settings.effects = (int)(g_cfg.volume * 100);
         else if (k == L"--mouse-sensitivity") g_settings.mouse = (float)_wtof(v);
         else if (k == L"--address") g_cfg.address = _wcstoui64(v, nullptr, 0);
+        else if (k == L"--lan") g_lan_arg = v;
+        else if (k == L"--lan-name") lan::g_name = narrow(v);
+        else if (k == L"--lan-port") lan::g_port = (uint16_t)_wtoi(v);
         else if (k == L"--input-connected") g_input_connected = _wtoi(v);
         else if (k == L"--flags") g_cfg.flags = (int)wcstol(v, nullptr, 0);
         else if (k == L"--scenario-path")
@@ -4584,6 +8218,10 @@ int wmain(int argc, wchar_t **argv)
         else if (k == L"--height") g_cfg.height = _wtoi(v), g_size_given = true;
         else { fprintf(stderr, "unknown option %s\n", narrow(k.c_str()).c_str()); return 2; }
     }
+    g_main_thread = GetCurrentThreadId();
+    if (lan::g_name.empty()) lan::g_name = menu::clean_name(g_settings.lan_name);
+    if (lan::g_name.empty()) lan::g_name = menu::default_name();
+    if (!g_lan_arg.empty()) lan::start(g_lan_arg);
     find_mcc_root();
     // The games open some of their files by paths relative to MCC's folder ("halo4\\...",
     // ".\\sound\\pc\\..."), as MCC itself runs from there: the working folder must be it,
@@ -4610,7 +8248,10 @@ int wmain(int argc, wchar_t **argv)
         if (g_cfg.width < 640 || g_cfg.height < 480) g_cfg.width = 1920, g_cfg.height = 1080;
     }
     if (g_cfg.borderless < 0) g_cfg.borderless = g_settings.windowed ? 0 : 1;
+    logf("Installation 08 1.2");
+    log_cpu();
     logf("picture %dx%d, %s", g_cfg.width, g_cfg.height, g_cfg.borderless ? "fullscreen" : "window");
+    note_other_instances();
     if (!create_window_and_device(L"Installation 08", device, context)) return 1;
     fonts::init(g_cfg.mcc_root);
     build_host_vtable();
@@ -4633,8 +8274,10 @@ int wmain(int argc, wchar_t **argv)
         else if (next.kind == next_action::k_game) next = run_game(next, device, context);
         else break;
     }
+    lan::shutdown();
     logf("installation08 exiting");
     save_settings();
+    if (!g_game_module) release_graphics(device, context); // (a game still running keeps them)
     // A normal exit runs the game DLLs' shutdown code again; nothing is left to save,
     // so end the process outright.
     log_flush();

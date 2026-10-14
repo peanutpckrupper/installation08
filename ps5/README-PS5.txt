@@ -1,4 +1,4 @@
-INSTALLATION 08 FOR PS5  -  version 1.1
+INSTALLATION 08 FOR PS5  -  version 1.2
 Play Halo: The Master Chief Collection on your jailbroken PS5, offline.
 
 Installation 08 runs inside prospero-win, the app that runs Windows games on the
@@ -18,6 +18,7 @@ BEFORE YOU START
   [ ] FileZilla is installed on your PC (filezilla-project.org, the free "Client").
   [ ] MCC is installed on your PC through Steam.
   [ ] About 50-130 GB free on the PS5, depending on which Halo games you copy.
+  [ ] A Windows PC (one file, ucrtbase.dll, comes from its Windows folder).
 
 
 STEP 1  -  Connect to your PS5
@@ -38,6 +39,15 @@ STEP 2  -  Copy this package to the PS5
      side, so it lands in /data/. FileZilla adds its contents to the prospero-win
      folder already there; nothing of yours is replaced. If it asks about files that
      already exist, choose "Skip". It is a few hundred MB.
+  4. One file from Windows, which Installation 08 needs and the package can't include:
+     a. On the left (PC) side, type  C:\Windows\System32  in the "Local site" box
+        and press Enter, and find  ucrtbase.dll  in the list.
+     b. On the right (PS5) side, open
+          /data/prospero-win/prefixes/installation08/drive_c/Games/Installation08/
+        (installation08.exe is there).
+     c. Drag ucrtbase.dll from the left into that folder on the right.
+     Without it Installation 08 doesn't start. (Why: the games' math must match
+     Windows' exactly for LAN games with a PC, and Wine's version differs slightly.)
 
 
 STEP 3  -  Add Installation 08 to prospero-win's game list
@@ -76,10 +86,14 @@ STEP 4  -  Copy your Halo games to the PS5
 
 
 STEP 5  -  Play
-  Open prospero-win on the PS5 and choose Installation 08. Pick a game, then
-  Campaign, Firefight, Spartan Ops, Custom game or Forge.
-  If a game runs slowly, lower Settings > Resolution in Installation 08 to 1600x900
-  or 1280x720.
+  Open prospero-win on the PS5 and choose Installation 08. The first time, it asks
+  for your player name (the name in the games and in LAN lobbies): pick letters with
+  the D-pad and Cross, Square deletes. Settings > Your name changes it later.
+  Then pick a game, and Campaign, Firefight, Spartan Ops, Custom game or Forge.
+  If a game runs slowly, lower Settings > Video > Resolution in Installation 08 to
+  1600x900 or 1280x720, or lower the quality settings on the same page.
+  LAN games on the main menu: join a game hosted by a PC (or another PS5) on your
+  network, campaign co-op included. See README.txt, LAN GAMES.
 
 
 CONTROLS
@@ -90,10 +104,37 @@ CONTROLS
   (PS4 controllers can't be used: the PS5 doesn't allow them in PS5 apps.)
 
 
+LAN GAMES (WITH OTHER PS5s AND PCs)
+  Installation 08 on a PS5 plays with other PS5s and PCs on the same network:
+  campaign co-op, Spartan Ops, Firefight, custom games and Forge.
+  To add a PC: copy installation08.exe (from Installation08-1.2.zip) into the PC's
+  MCC folder, next to halo1, halo2, halo3 ... and run it. Allow it through the
+  Windows firewall on private networks when asked.
+  The ucrtbase.dll you copied in step 2.4 is what keeps a PS5 and a PC in step:
+  Wine does some of the games' math very slightly differently from Windows, enough
+  for a LAN game between them to drift apart ("lost connection" after a minute or so).
+  To host: on any machine, LAN games on the main menu > Host a game. Choose the
+  game, the mode and its options.
+  To join: LAN games on the main menu, then pick the host's game from the list
+  (or Join by IP address).
+  The lobby shows who is ready and what anyone is missing (for co-op, every machine
+  needs that game's campaign). The host presses Start; after the game everyone
+  comes back to the lobby. Co-op starts from the beginning of a mission: co-op
+  checkpoints can't be continued in a later session.
+  Every machine needs the same version of Installation 08.
+
+
 UPDATING INSTALLATION 08
   Copy the new installation08.exe over FTP into
     /data/prospero-win/prefixes/installation08/drive_c/Games/Installation08/
   replacing the old one. Your settings and saves are in that folder and are kept.
+  From 1.1 to 1.2, two more things, together (one without the other and Installation
+  08 won't start):
+    1. Copy ucrtbase.dll from your PC into that same folder (step 2.4).
+    2. On the right side, right-click /data/prospero-win/profiles/installation08.profile
+       > View/Edit, and change the line that starts with  dll_overrides =  to:
+         dll_overrides = d3d8,d3d9,d3d10core,d3d11,dxgi,xaudio2_9,ucrtbase=n
+       Save, close the editor, and click Yes when FileZilla asks to upload it.
 
 
 IF SOMETHING GOES WRONG
@@ -106,6 +147,7 @@ IF SOMETHING GOES WRONG
   Installation 08 isn't in prospero-win's list
       Check step 3, and that /data/prospero-win/profiles/installation08.profile exists.
   It goes straight back to prospero-win's list
-      Something failed; the logs say what. Send these with your bug report:
+      Check that ucrtbase.dll is next to installation08.exe (step 2.4).
+      Otherwise something else failed; the logs say what. Send these with your bug report:
         /data/prospero-win/prefixes/installation08/drive_c/Games/Installation08/installation08.log
         the newest files in /data/prospero-win/logs/
