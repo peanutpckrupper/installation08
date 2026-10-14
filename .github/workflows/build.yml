@@ -16,9 +16,9 @@ jobs:
         working-directory: src
         run: |
           x86_64-w64-mingw32-windres installation08.rc -O coff -o res.o
-          x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -static -s -Wall -Wno-unused-parameter \
+          x86_64-w64-mingw32-g++ -std=c++17 -Os -municode -static -s -Wall -Wno-unused-parameter \
             -o installation08.exe installation08.cpp res.o \
-            -ld3d11 -ldxgi -lgdi32 -ld2d1 -ldwrite -ladvapi32
+            -ld3d11 -ldxgi -lgdi32 -ld2d1 -ldwrite -ladvapi32 -lws2_32 -lole32 -lwindowscodecs -luuid
       - uses: actions/upload-artifact@v4
         with:
           name: installation08
