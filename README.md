@@ -7,7 +7,7 @@ Installation 08 runs MCC's six Halo games on the PS5 through [prospero-win](http
 Installation 08 includes no game files. You need your own copy of Halo: The Master Chief Collection on Steam.
 
 <p align="center">
-  <img src="docs/images/splash.png" width="49%"> <img src="docs/images/main.png" width="49%">
+  <img src="docs/images/splash.png" width="49%"> <img src="docs/images/menu.png" width="49%">
 </p>
 
 ## Download
