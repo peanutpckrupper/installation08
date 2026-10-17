@@ -58,7 +58,7 @@ Already playing through prospero-win? That still works: replace `installation08.
 
 PS5s and PCs running Installation 08 play together on the same network. To add a PC:
 
-1. On the PC, copy `installation08.exe` (from `Installation08-<version>.zip`) into your MCC folder, next to `halo1`, `halo2`, `halo3` … For Steam that's usually `C:\\\\Program Files (x86)\\\\Steam\\\\steamapps\\\\common\\\\Halo The Master Chief Collection`. Then run it.
+1. On the PC, copy `installation08.exe` (from `Installation08-<version>.zip`) into your MCC folder, next to `halo1`, `halo2`, `halo3` … For Steam that's usually `C:\Program Files (x86)\Steam\steamapps\common\Halo The Master Chief Collection`. Then run it.
 2. **To host:** on any machine, open a lobby from the main menu (**Campaign**, **Multiplayer**, **Firefight**, **Spartan Ops** or **Forge**) and set **Lobby** to **LAN**.
 3. **To join:** on the other machines, choose **Browse games** on the main menu and pick the host's lobby, or use **Join by IP address**.
 4. The lobby shows each player as Ready, or what they're missing. For example, campaign co-op needs that game's campaign installed on every machine. When everyone is ready, the host presses **Start**. After the game, everyone comes back to the lobby.
@@ -105,16 +105,16 @@ One C++ source file and Monocypher (one C file), built with MinGW-w64 (Linux or 
 
 ```sh
 cd src
-x86\\\_64-w64-mingw32-windres installation08.rc -O coff -o res.o
-x86\\\_64-w64-mingw32-gcc -O2 -c monocypher/monocypher.c -o monocypher.o
-x86\\\_64-w64-mingw32-g++ -std=c++17 -O2 -municode -static -Wall -Wno-unused-parameter \\\\
-    -o installation08.exe installation08.cpp monocypher.o res.o \\\\
-    -ld3d11 -ldxgi -lgdi32 -ld2d1 -ldwrite -ladvapi32 -lws2\\\_32 -lole32 -lwindowscodecs -luuid -lbcrypt
+x86_64-w64-mingw32-windres installation08.rc -O coff -o res.o
+x86_64-w64-mingw32-gcc -O2 -c monocypher/monocypher.c -o monocypher.o
+x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -static -Wall -Wno-unused-parameter \
+    -o installation08.exe installation08.cpp monocypher.o res.o \
+    -ld3d11 -ldxgi -lgdi32 -ld2d1 -ldwrite -ladvapi32 -lws2_32 -lole32 -lwindowscodecs -luuid -lbcrypt
 ```
 
 The exe is left unstripped (no `-s`): stripped builds are flagged by Windows Defender far more often.
 
-The online server's address isn't in the source: builds name it with `-DI08\_SERVER="host\[:port]"` (GitHub Actions takes it from the repository secret `I08\_SERVER`). Without it the exe is LAN only.
+The online server's address isn't in the source: builds name it with `-DI08_SERVER="host[:port]"` (GitHub Actions takes it from the repository secret `I08_SERVER`). Without it the exe is LAN only.
 
 Every push is also built by GitHub Actions, and the exe is attached to each run.
 
@@ -134,15 +134,14 @@ Installation 08 is made by **peanutpckrupper**
 
 It stands on other people's work:
 
-* [**prospero-win**](https://github.com/mpereiraesaa/prospero-win) by mpereiraesaa and its contributors: Wine on the PS5. The PS5 app is its title, built for one game, with its Wine, Mesa and RADV builds.
-* [**PS5-Lapy-JB-Daemon**](https://github.com/mpereiraesaa/PS5-Lapy-JB-Daemon) and the [**PS5 Native App Boilerplate**](https://github.com/mpereiraesaa/ps5-native-app-boilerplate), also by mpereiraesaa: the app's access to `/data`, and the base for building PS5 apps.
-* [**The PS5 payload SDK**](https://github.com/ps5-payload-dev/sdk) by John Törnblom and the ps5-payload-dev contributors: the toolchain behind the app.
-* [**Wine**](https://www.winehq.org), [**DXVK**](https://github.com/doitsujin/dxvk) and [**Mesa**](https://www.mesa3d.org): Windows, Direct3D 11 and OpenGL on top of Vulkan.
-* [**Monocypher**](https://monocypher.org) by Loup Vaillant: the encryption behind LAN and online play.
-* [**Titillium Web**](https://fonts.google.com/specimen/Titillium+Web), from the Accademia di Belle Arti di Urbino: the menus' font.
+* **[prospero-win](https://github.com/mpereiraesaa/prospero-win)** by mpereiraesaa and its contributors: Wine on the PS5. The PS5 app is its title, built for one game, with its Wine, Mesa and RADV builds.
+* **[PS5-Lapy-JB-Daemon](https://github.com/mpereiraesaa/PS5-Lapy-JB-Daemon)** and the **[PS5 Native App Boilerplate](https://github.com/mpereiraesaa/ps5-native-app-boilerplate)**, also by mpereiraesaa: the app's access to `/data`, and the base for building PS5 apps.
+* **[The PS5 payload SDK](https://github.com/ps5-payload-dev/sdk)** by John Törnblom and the ps5-payload-dev contributors: the toolchain behind the app.
+* **[Wine](https://www.winehq.org)**, **[DXVK](https://github.com/doitsujin/dxvk)** and **[Mesa](https://www.mesa3d.org)**: Windows, Direct3D 11 and OpenGL on top of Vulkan.
+* **[Monocypher](https://monocypher.org)** by Loup Vaillant: the encryption behind LAN and online play.
+* **[Titillium Web](https://fonts.google.com/specimen/Titillium+Web)**, from the Accademia di Belle Arti di Urbino: the menus' font.
 * **ShadowMountPlus**, which installs the app from `/data/homebrew`, and everyone behind the PS5 jailbreak that makes homebrew possible.
 * **Bungie, 343 Industries and Halo Studios**, for the games.
-
 
 
 ## Third-party components
