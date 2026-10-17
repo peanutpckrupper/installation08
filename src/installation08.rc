@@ -1,7 +1,7 @@
 #include <winver.h>
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,2,0,0
-PRODUCTVERSION 1,2,0,0
+FILEVERSION 1,3,0,0
+PRODUCTVERSION 1,3,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -11,8 +11,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Installation 08 - offline launcher"
       VALUE "ProductName", "Installation 08"
-      VALUE "FileVersion", "1.2.0"
-      VALUE "ProductVersion", "1.2.0"
+      VALUE "FileVersion", "1.3.0"
+      VALUE "ProductVersion", "1.3.0"
       VALUE "OriginalFilename", "installation08.exe"
       VALUE "InternalName", "Installation 08"
     END
@@ -22,3 +22,9 @@ BEGIN
     VALUE "Translation", 0x409, 1200
   END
 END
+
+// Titillium Web (SIL Open Font License 1.1, fonts/OFL.txt): the menus' font, so they
+// look the same on every machine.
+201 RCDATA "fonts/TitilliumWeb-Regular.ttf"
+202 RCDATA "fonts/TitilliumWeb-SemiBold.ttf"
+203 RCDATA "fonts/TitilliumWeb-Bold.ttf"

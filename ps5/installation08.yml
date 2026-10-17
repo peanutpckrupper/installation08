@@ -21,11 +21,12 @@
 # Installation 08 1.1 or later: it puts MCC's own XAudio 2.9 in the prefix
 # the first time it runs, which the games need.
 #
-# ucrtbase = n: the player copies Windows' own ucrtbase.dll next to
-# installation08.exe (README-PS5.txt, step 2.4); the package doesn't include it.
-# Wine's C runtime math differs slightly from Windows', which desyncs LAN games
-# between a PS5 and a PC. Without the file the game doesn't start (prospero-win
-# doesn't start it with n,b either).
+# ucrtbase = n: Microsoft's ucrtbase.dll goes next to installation08.exe, and
+# Wine uses it instead of its own. Wine's C runtime math differs slightly from
+# Windows', which desyncs LAN games between a PS5 and a PC. Without the file the
+# game doesn't start (prospero-win doesn't start it with n,b either), so the
+# package ships it. Use the x64 copy from the Windows SDK's redistributable
+# folder, Redist\10.0.<version>\ucrt\DLLs\x64\ucrtbase.dll.
 name: "Installation 08 (Halo: The Master Chief Collection)"
 game_slug: installation08
 version: Installation 08 1.2 (Prospero Win)
@@ -43,6 +44,7 @@ script:
     prefix: $GAMEDIR
   files:
   - exe: "N/A:Select installation08.exe (Installation 08 1.1 or later)"
+  - ucrtbase: "N/A:Select ucrtbase.dll (x64, Windows SDK Redist\\...\\ucrt\\DLLs\\x64)"
   wine:
     dxvk: true
     dxvk_version: "2.6.2"
@@ -52,3 +54,4 @@ script:
   installer:
   - task: {name: create_prefix, prefix: $GAMEDIR}
   - copy: {src: exe, dst: $GAMEDIR/drive_c/Games/Installation08}
+  - copy: {src: ucrtbase, dst: $GAMEDIR/drive_c/Games/Installation08}

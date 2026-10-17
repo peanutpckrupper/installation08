@@ -1,39 +1,75 @@
 MAKING THE PS5 PACKAGE (for whoever publishes a release, not for players)
 
-Players get Installation08-PS5.zip: a ready Wine prefix with installation08.exe, its
-prospero-win profile, and README-PS5.txt. It is made once per release on a PC that
-has prospero-win's source and its PC Wine (tools/build_host_wine.sh), in WSL.
-It holds Wine's own files (LGPL), DXVK (zlib licence), prospero-win's wowprospero.dll
-(LGPL) and installation08.exe. No MCC files and nothing from Windows: players copy
-ucrtbase.dll from their own PC (README-PS5.txt, step 2.4), which the profile needs.
+Players get Installation08-PS5-<version>.zip: the PPSA99908 folder, a PS5 app that runs
+Installation 08 directly. It is prospero-win's PS5 title built for one game, with
+prospero-win's Wine runtime, a ready Wine prefix holding installation08.exe and
+Microsoft's ucrtbase.dll, and README-PS5.txt as README.txt. No MCC files.
 
-From prospero-win's source folder:
+What you need
+  - prospero-win's source at commit 644e32e (github.com/mpereiraesaa/prospero-win), with
+    its native foundation ready (tools/build_native.sh's dependencies: the PS5 payload
+    SDK, zlib, runtime/libc.prx).
+  - The Lapy helper's source (github.com/mpereiraesaa/PS5-Lapy-JB-Daemon, tag
+    v0.3.2-experimental), to build lapy.elf for the title id PPSA99908. The helper is
+    tied to one title id, so prospero-win's own release copy doesn't work here.
+  - A prospero-win release app folder (PPSA99995) for the Wine runtime (win/), its
+    LICENSES, SOURCES.txt and THIRD_PARTY.md.
+  - An installation08 prefix, as on a console running prospero-win
+    (/data/prospero-win/prefixes/installation08): made from installation08.yml the old
+    way (see the end), or copied off a console. make_app.py strips the player's own
+    files from it.
+  - installation08.exe (a release build: no -DI08_ONLINE) and Microsoft's x64
+    ucrtbase.dll (Windows SDK Redist\10.0.<version>\ucrt\DLLs\x64), if the prefix lacks it.
 
-1. Make the prefix with the recipe:
-     python3 tools/pw_install.py /path/to/installation08.yml \
-         --library ~/i08-library --wine <PC Wine>/bin/wine \
-         --file exe=/path/to/installation08.exe
-   (--library must be a new folder or one without an installation08 prefix yet.)
+1. Lapy helper for PPSA99908 (from the Lapy source folder):
+     python3 tools/build_owned_daemon.py --sdk <payload SDK> \
+         --logging-client <prospero-win>/native/ps5log --elf-helper --title PPSA99908
+   -> build/owned_root_helper-PPSA99908/lapy.elf
 
-2. Turn it into the package (wowprospero.dll comes from a prospero-win app folder,
-   win/wine/lib/wine/x86_64-windows/):
-     python3 /path/to/make_ps5_package.py --prospero . --library ~/i08-library \
-         --cpu-dll /path/to/wowprospero.dll --readme /path/to/README-PS5.txt \
-         --out ~/Installation08-PS5
-   This writes ~/Installation08-PS5/ and ~/Installation08-PS5.zip, laid out as
-   /data/prospero-win on the console (as tools/pw_prefix.py push would leave it), with
-   the profile set to graphics = opengl, the mode Installation 08 was tested with.
+2. The title (from prospero-win's source folder, with ps5/app/installation08-app.patch
+   applied: git am <installation08>/ps5/app/installation08-app.patch):
+     PW_FOUNDATION_READY=1 PW_TITLE_ID=PPSA99908 \
+     PW_LAPY_ELF=<lapy>/build/owned_root_helper-PPSA99908/lapy.elf \
+     PW_SCE_SYS=<installation08>/ps5/app/sce_sys \
+     PW_EXTRA_CFLAGS='-DPW_FIXED_PROFILE="installation08" -DPW_DATA_NAME="installation08" -DPW_APP_NAME="installation08-wine64" -DPW_RESTART_FLAG="drive_c/Games/Installation08/restart.flag"' \
+     bash tools/build_native.sh
+   -> dist/PPSA99908 (eboot.bin, sce_module/libc.prx, lapy.elf, sce_sys)
 
-3. Test it the way a player would: follow README-PS5.txt on a console.
+3. The package (from this repository's ps5 folder):
+     python3 app/make_app.py --title <prospero-win>/dist/PPSA99908 \
+         --runtime <prospero-win release>/PPSA99995 --prefix <installation08 prefix> \
+         --exe installation08.exe [--ucrtbase ucrtbase.dll] --extra app \
+         --readme README-PS5.txt --patch app/installation08-app.patch \
+         --out <out>/Installation08-PS5-<version>/PPSA99908 --no-32bit
+   It writes the folder and Installation08-PS5-<version>.zip beside it. What it does:
+     - leaves out Wine's placeholder files (stand-ins for Windows DLLs that only say
+       "load Wine's own"); placeholders.txt lists them and the app makes them from its
+       runtime on first start. That halves the package and keeps out the stand-ins
+       Windows Defender flags (iexplore.exe and friends, also dropped from the runtime);
+     - with --no-32bit, leaves out Wine's 32-bit side (Installation 08 and MCC are
+       64-bit): the package is about 275 MB, 90 MB zipped;
+     - removes the player's own files from the prefix (settings, log, saves, results,
+       LAN id, temp files) and puts back Wine's xaudio2_9.dll if MCC's was copied in;
+     - copies the profile (app/bundle/profiles) and the MCC placeholder folder.
 
-A new release of installation08.exe alone doesn't need a new package: players
-replace the exe (README-PS5.txt, "Updating"). Make a new package when the prefix
-or profile changes.
+4. Test it the way a player would: README-PS5.txt on a console, from a clean
+   /data/installation08.
 
-When only installation08.exe, README-PS5.txt or a profile line changes, the last
-package can be updated instead of made again:
-  - replace prospero-win/prefixes/installation08/drive_c/Games/Installation08/installation08.exe
-  - replace README.txt with the new README-PS5.txt
-  - edit prospero-win/profiles/installation08.profile if its line changed (1.2:
-    dll_overrides = d3d8,d3d9,d3d10core,d3d11,dxgi,xaudio2_9,ucrtbase=n)
-  - zip the Installation08-PS5 folder again (the zip holds the folder itself).
+A new installation08.exe alone doesn't need a new package: players replace the exe in
+/data/installation08/prefixes/installation08/drive_c/Games/Installation08. The app
+never overwrites files that are already there.
+
+How the app differs from prospero-win (installation08-app.patch)
+  - Started from the home screen, it runs the installation08 profile instead of the
+    game list.
+  - Its data folder is /data/installation08. On each start it copies the files of its
+    bundle (app0/bundle) that are missing there, then makes the missing placeholders.
+  - When Installation 08 ends, the app closes back to the home screen through the
+    system (sceSystemServiceLoadExec("exit"), then KillApp): ending the process
+    showed CE-108255-1. A restart.flag left by Installation 08 starts it again
+    instead. /data/installation08/exit_method (digits 1-4) overrides the close
+    methods, for testing.
+
+The old way (prospero-win profile): installation08.yml and make_ps5_package.py make a
+/data/prospero-win package for players who run Installation 08 inside prospero-win. It
+needs prospero-win's PC Wine (tools/build_host_wine.sh) and tools/pw_install.py.

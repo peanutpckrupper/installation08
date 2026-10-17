@@ -1,0 +1,3 @@
+Copy your MCC folders here: halo1, halo2, halo3, halo3odst, haloreach, halo4 and
+groundhog (H2A multiplayer), the ones you want, and from the mcc folder only
+mcc/binaries/win64, keeping its path.

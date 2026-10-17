@@ -1,0 +1,531 @@
+From e09df9b0794dece3faa84a7415da619e285f5ec5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 14:23:58 -0400
+Subject: [PATCH 1/3] Single-game title mode for the Installation 08 app
+
+PW_FIXED_PROFILE starts one profile from Home, copies a bundled library to
+the data folder on first start, and closes (or restarts on a flag) when the
+game ends. build_native.sh takes a title id, a local Lapy helper, sce_sys
+folder and extra compiler flags.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017heTRKLYxAFfzQ4NtBUsib
+---
+ native/wine64_main.c  | 133 +++++++++++++++++++++++++++++++++++++++++-
+ tools/build_native.sh |  31 ++++++++--
+ 2 files changed, 155 insertions(+), 9 deletions(-)
+
+diff --git a/native/wine64_main.c b/native/wine64_main.c
+index 65a2111..4514a45 100644
+--- a/native/wine64_main.c
++++ b/native/wine64_main.c
+@@ -44,6 +44,8 @@
+ #include "pw_wine_display.h"
+ #include "../include/prospero_win.h"
+ 
++#include <dirent.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -56,8 +58,14 @@
+ #include <time.h>
+ #include <unistd.h>
+ 
++/* A fork can build the title under its own id and data folder (see
++ * PW_FIXED_PROFILE below) by defining these on the compiler's command line. */
++#ifndef PW_TITLE_ID
+ #define PW_TITLE_ID "PPSA99995"
++#endif
++#ifndef PW_APP_NAME
+ #define PW_APP_NAME "prospero-win-wine64"
++#endif
+ 
+ /* Where the title's Wine runtime can be seen: /app0 inside the sandbox;
+  * once /data is granted the process sees the real root, where /app0 does
+@@ -68,8 +76,23 @@
+ #define PW_SANDBOX_APP0 "/mnt/sandbox/" PW_TITLE_ID "_000/app0"
+ static const char *const runtime_roots[] = { "/app0", PW_SANDBOX_APP0 };
+ /* The title's data: profiles/, input/, prefix/ and prefixes/<name>. */
+-#define PW_WINE64_ROOT_DATA "/data/prospero-win"            /* when /data is granted */
+-#define PW_WINE64_ROOT_SANDBOX "/download0/prospero-win"    /* sandbox fallback */
++#ifndef PW_DATA_NAME
++#define PW_DATA_NAME "prospero-win"
++#endif
++#define PW_WINE64_ROOT_DATA "/data/" PW_DATA_NAME            /* when /data is granted */
++#define PW_WINE64_ROOT_SANDBOX "/download0/" PW_DATA_NAME    /* sandbox fallback */
++/* PW_FIXED_PROFILE "<id>" makes a single-game title: started from Home it runs
++ * that profile instead of showing the launcher, and when the game ends the
++ * title closes (or starts the game again when the game left
++ * PW_RESTART_FLAG, a path in its prefix, behind). The first start copies
++ * the title's bundled library (app0/bundle: profiles/, prefixes/, and any
++ * other folders) into the data folder, never over files already there. */
++#if defined(PW_FIXED_PROFILE) && !defined(PW_LAUNCHER_EMPTY)
++#define PW_LAUNCHER_EMPTY "THE GAME'S FILES ARE MISSING: REINSTALL THE APP"
++#endif
++#ifndef PW_LAUNCHER_EMPTY
++#define PW_LAUNCHER_EMPTY "ADD PROFILES TO /DATA/PROSPERO-WIN/PROFILES"
++#endif
+ #ifndef PW_WINE64_DEBUG
+ /* No +seh: WoW64 callback returns unwind with 80000026 many times a second
+  * and would flood the sink. */
+@@ -627,15 +650,99 @@ static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reas
+ 
+ /* Wine ends the process with exit() when its last program ends: go back to
+  * the launcher. */
++static char game_prefix[PW_WINE_LIBRARY_PATH + PW_APP_ID_CAPACITY];
++
+ static void on_exit_report(void)
+ {
+     PS5LOG_LOG("PW_WINE64 exit sink_calls=%lu", sink_calls);
++#ifdef PW_FIXED_PROFILE
++#ifdef PW_RESTART_FLAG
++    {
++        char flag[sizeof(game_prefix) + 128];
++        snprintf(flag, sizeof(flag), "%s/%s", game_prefix, PW_RESTART_FLAG);
++        if (launch.app && game_prefix[0] && unlink(flag) == 0) {
++            PS5LOG_LOG("PW_WINE64 restart flag found: starting %s again", launch.app->id);
++            restart_title(launch.app, launch.cycle + 1u, "restart-flag");
++        }
++    }
++#endif
++    /* Back to Home. */
++    pw_diagnostics_close("wine64-exit");
++    return;
++#endif
+     restart_title(NULL, launch.cycle + 1u, "wine-exit");
+     pw_diagnostics_close("wine64-exit");
+ }
+ 
+ /* ---- library ------------------------------------------------------------ */
+ 
++#ifdef PW_FIXED_PROFILE
++/* Copy from into to, file by file, keeping what to already has. Returns the
++ * number of files copied, or -1 when from cannot be read. */
++static long copy_missing(const char *from, const char *to, int depth)
++{
++    DIR *dir;
++    struct dirent *entry;
++    long copied = 0;
++
++    if (depth > 24 || !(dir = opendir(from))) return -1;
++    mkdir(to, 0777);
++    while ((entry = readdir(dir))) {
++        char source[1024], target[1024];
++        struct stat info;
++
++        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
++        if (snprintf(source, sizeof(source), "%s/%s", from, entry->d_name) >= (int)sizeof(source) ||
++            snprintf(target, sizeof(target), "%s/%s", to, entry->d_name) >= (int)sizeof(target) ||
++            stat(source, &info))
++            continue;
++        if (S_ISDIR(info.st_mode)) {
++            long below = copy_missing(source, target, depth + 1);
++            if (below > 0) copied += below;
++            continue;
++        }
++        if (!S_ISREG(info.st_mode) || !access(target, F_OK)) continue;
++        {
++            char part[1040];
++            int in = open(source, O_RDONLY), out;
++            static char buffer[1 << 20];
++            ssize_t got = 0;
++
++            if (in < 0) continue;
++            snprintf(part, sizeof(part), "%s.part", target);
++            out = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++            if (out < 0) { close(in); continue; }
++            while ((got = read(in, buffer, sizeof(buffer))) > 0)
++                if (write(out, buffer, (size_t)got) != got) { got = -1; break; }
++            close(in);
++            if (close(out) || got < 0 || rename(part, target)) { unlink(part); continue; }
++            copied++;
++        }
++    }
++    closedir(dir);
++    return copied;
++}
++
++/* The first start, or one after a game file was deleted: put the bundled
++ * library in place. Only missing files are copied, so settings, saves and
++ * an updated exe stay. */
++static void install_bundle(const char *root)
++{
++    for (size_t i = 0; i < sizeof(runtime_roots) / sizeof(runtime_roots[0]); i++) {
++        char bundle[256];
++        uint64_t began = now_ns();
++        long copied;
++
++        snprintf(bundle, sizeof(bundle), "%s/bundle", runtime_roots[i]);
++        mkdir(root, 0777);
++        copied = copy_missing(bundle, root, 0);
++        PS5LOG_LOG("PW_WINE64 bundle from=%s copied=%ld ms=%llu", bundle, copied,
++                   (unsigned long long)((now_ns() - began) / 1000000u));
++        if (copied >= 0) return;
++    }
++}
++#endif
++
+ /* Complete the one-shot helper exchange before loading profiles or starting
+  * Wine. A failed or incomplete request closes this process to Home. */
+ static int open_library(void)
+@@ -651,6 +758,9 @@ static int open_library(void)
+                mount.helper_errno, mount.data_after, mount.elevated_after, mount.waited_ms,
+                mount.settled_ms, status == 0 ? library_root : "unavailable");
+     if (status != 0) return -1;
++#ifdef PW_FIXED_PROFILE
++    install_bundle(library_root);
++#endif
+     status = pw_wine_library_load(&library, library_root);
+     catalog_count = 0;
+     for (uint32_t i = 0; i < library.count; i++) {
+@@ -712,7 +822,7 @@ static void run_launcher(void)
+     uint8_t *frame = mmap(NULL, frame_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+     PwLauncherScene scene = { items, 0, PW_LAUNCHER_RENDER_NONE,
+         launch.refused ? "THAT GAME IS NOT IN THE LIBRARY" :
+-        !catalog_count ? "ADD PROFILES TO /DATA/PROSPERO-WIN/PROFILES" :
++        !catalog_count ? PW_LAUNCHER_EMPTY :
+         launch.cycle ? "WELCOME BACK" : "CHOOSE A GAME" };
+     static PwHidPs5 hid;
+     int video_status = pw_videoout_ps5_open(&video), pad_status = pw_pad_ps5_platform_ops(&pad_ops);
+@@ -966,6 +1076,22 @@ int main(int argc, char **argv)
+         return 1;
+     }
+     (void)pw_wine_launch_parse(argc, argv, catalog, catalog_count, &launch);
++#ifdef PW_FIXED_PROFILE
++    /* Started from Home: the title's one game, as if the launcher chose it. */
++    if (launch.mode != PW_WINE_LAUNCH_GAME && !launch.refused) {
++        for (size_t i = 0; i < catalog_count; i++) {
++            static char storage[2 * PW_WINE_LAUNCH_PATH_MAX + 64];
++            char *words[PW_WINE_LAUNCH_ARGS];
++            size_t count;
++
++            if (strcmp(catalog[i].id, PW_FIXED_PROFILE)) continue;
++            count = pw_wine_launch_argv(&catalog[i], launch.cycle, storage, sizeof(storage), words,
++                                        PW_WINE_LAUNCH_ARGS);
++            if (count) (void)pw_wine_launch_parse((int)count, words, catalog, catalog_count, &launch);
++            break;
++        }
++    }
++#endif
+     (void)pw_diagnostics_open(library_root, PW_BUILD_ID,
+                               launch.app ? launch.app->id : "launcher", launch.cycle);
+     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
+@@ -981,6 +1107,7 @@ int main(int argc, char **argv)
+         snprintf(prefix, sizeof(prefix), "%s/prefixes/%s", library_root, game->app.prefix);
+     else
+         snprintf(prefix, sizeof(prefix), "%s/prefix", library_root);
++    snprintf(game_prefix, sizeof(game_prefix), "%s", prefix);
+     snprintf(radv_cache, sizeof(radv_cache), "%s/cache/radv", library_root);
+     if (game) {
+         int input_status = pw_wine_library_input(game, library_root, &game_input);
+diff --git a/tools/build_native.sh b/tools/build_native.sh
+index fc4edc8..5c361d5 100755
+--- a/tools/build_native.sh
++++ b/tools/build_native.sh
+@@ -21,6 +21,14 @@
+ #                          two seconds, for diagnosing stalls (default 0)
+ #   Lapy helper             fetched from the GitHub release pinned below
+ #                          (lapy_release, lapy_elf_sha256)
++#   PW_TITLE_ID            the title's id (default PPSA99995); a fork's own
++#                          id also needs PW_LAPY_ELF built for that id
++#   PW_LAPY_ELF            a locally built lapy.elf to bundle instead of
++#                          fetching the release (its build checks the title)
++#   PW_SCE_SYS             folder with the title's param.json and icon0.png
++#                          (default sce_sys)
++#   PW_EXTRA_CFLAGS        more compiler words for the title's C files, such
++#                          as a fork's -DPW_FIXED_PROFILE=...
+ set -euo pipefail
+ 
+ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+@@ -39,7 +47,9 @@ wine64_script=${PW_WINE64_SCRIPT:-0}
+ wine64_seconds=${PW_WINE64_SECONDS:-0}
+ wine64_cycles=${PW_WINE64_SCRIPT_CYCLES:-2}
+ wine64_watchdog=${PW_WINE64_WAIT_WATCHDOG:-0}
+-title_id=PPSA99995
++title_id=${PW_TITLE_ID:-PPSA99995}
++sce_sys=${PW_SCE_SYS:-$root/sce_sys}
++read -r -a extra_cflags <<< "${PW_EXTRA_CFLAGS:-}"
+ 
+ [[ $native_mode == wine64 ]] || {
+     echo "PW_NATIVE_MODE must be wine64: the direct Win32 runtime was removed" >&2; exit 2; }
+@@ -53,6 +63,11 @@ title_id=PPSA99995
+     echo "PW_OUTPUT_SUFFIX must contain only letters, digits, '_' or '-'" >&2
+     exit 2
+ }
++if [[ -n ${PW_LAPY_ELF:-} ]]; then
++    lapy_helper_elf=$PW_LAPY_ELF
++    [[ $(od -An -tx1 -N4 "$lapy_helper_elf" | tr -d ' \n') == 7f454c46 ]] || {
++        echo "PW_LAPY_ELF $lapy_helper_elf is not an ELF file" >&2; exit 2; }
++else
+ helper_download=$(mktemp -d "${TMPDIR:-/tmp}/prospero-lapy-helper.XXXXXX")
+ trap 'rm -rf -- "$helper_download"' EXIT
+ python3 "$root/tools/fetch_lapy_helper.py" \
+@@ -77,6 +92,7 @@ try:
+ except ValueError as error:
+     raise SystemExit(str(error))
+ PY
++fi
+ 
+ if [[ ! -e $foundation/.git ]]; then
+     mkdir -p -- "$(dirname -- "$foundation")"
+@@ -136,8 +152,10 @@ build="$root/build/native$output_suffix"
+ dist="$root/dist/$title_id$output_suffix"
+ rm -rf -- "$build" "$dist"
+ mkdir -p "$build/obj" "$build/import-stubs" "$dist/sce_sys" "$dist/sce_module"
+-cp "$helper_download/release.json" "$build/lapy-helper-release.json"
+-cp "$helper_download/lapy-manifest.json" "$build/lapy-helper-manifest.json"
++if [[ -z ${PW_LAPY_ELF:-} ]]; then
++    cp "$helper_download/release.json" "$build/lapy-helper-release.json"
++    cp "$helper_download/lapy-manifest.json" "$build/lapy-helper-manifest.json"
++fi
+ 
+ cc=(env PS5_PAYLOAD_SDK="$sdk" sh "$foundation/tooling/prospero-clang18")
+ # A source archive has no Git metadata; its builds report "unknown".
+@@ -150,7 +168,8 @@ common=(-DPW_BUILD_ID=\""$build_id"\" -O2 -Wall -Wextra -Werror -ffunction-secti
+         -I"$root/include" -I"$root/src" -I"$root/native"
+         -I"$root/native/ps5log"
+         -DPW_WINE64_SCRIPT="$wine64_script" -DPW_WINE64_SECONDS="$wine64_seconds"
+-        -DPW_WINE64_SCRIPT_CYCLES="$wine64_cycles" -DPW_WINE64_WAIT_WATCHDOG="$wine64_watchdog")
++        -DPW_WINE64_SCRIPT_CYCLES="$wine64_cycles" -DPW_WINE64_WAIT_WATCHDOG="$wine64_watchdog"
++        -DPW_TITLE_ID=\""$title_id"\" "${extra_cflags[@]}")
+ 
+ sources=(
+     native/wine64_main.c native/pw_diagnostics.c native/pw_audio_ps5.c native/pw_pad_ps5.c native/pw_agc_ps5.c
+@@ -202,8 +221,8 @@ objects+=("$build/obj/ps5log.o" "$build/obj/ps5log_ps5_net.o")
+     --magic 0x1D3D154F
+ # The console installer copies icon0.png into /user/app/<title> and aborts
+ # the whole registration if it is absent, so it is not optional.
+-[[ -f $root/sce_sys/icon0.png ]] || python3 "$root/tools/make_icon.py"
+-cp "$root/sce_sys/param.json" "$root/sce_sys/icon0.png" "$dist/sce_sys/"
++[[ -f $sce_sys/icon0.png ]] || python3 "$root/tools/make_icon.py"
++cp "$sce_sys/param.json" "$sce_sys/icon0.png" "$dist/sce_sys/"
+ cp "$foundation/runtime/libc.prx" "$dist/sce_module/libc.prx"
+ cp "$lapy_helper_elf" "$dist/lapy.elf"
+ # The console refuses to start a title whose eboot lacks execute permission
+-- 
+2.43.0
+
+
+From bcebca48fbc5590fa45441e4a7918b84a2bc65df Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 14:39:35 -0400
+Subject: [PATCH 2/3] Installation 08 app: make Wine's placeholder files on
+ first start
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017heTRKLYxAFfzQ4NtBUsib
+---
+ native/wine64_main.c | 91 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 71 insertions(+), 20 deletions(-)
+
+diff --git a/native/wine64_main.c b/native/wine64_main.c
+index 4514a45..2134bca 100644
+--- a/native/wine64_main.c
++++ b/native/wine64_main.c
+@@ -677,6 +677,25 @@ static void on_exit_report(void)
+ /* ---- library ------------------------------------------------------------ */
+ 
+ #ifdef PW_FIXED_PROFILE
++/* Copy one file through a .part beside the target. 0, or -1. */
++static int copy_file(const char *source, const char *target)
++{
++    static char buffer[1 << 20];
++    char part[1040];
++    int in = open(source, O_RDONLY), out;
++    ssize_t got = 0;
++
++    if (in < 0) return -1;
++    snprintf(part, sizeof(part), "%s.part", target);
++    out = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (out < 0) { close(in); return -1; }
++    while ((got = read(in, buffer, sizeof(buffer))) > 0)
++        if (write(out, buffer, (size_t)got) != got) { got = -1; break; }
++    close(in);
++    if (close(out) || got < 0 || rename(part, target)) { unlink(part); return -1; }
++    return 0;
++}
++
+ /* Copy from into to, file by file, keeping what to already has. Returns the
+  * number of files copied, or -1 when from cannot be read. */
+ static long copy_missing(const char *from, const char *to, int depth)
+@@ -702,27 +721,57 @@ static long copy_missing(const char *from, const char *to, int depth)
+             continue;
+         }
+         if (!S_ISREG(info.st_mode) || !access(target, F_OK)) continue;
+-        {
+-            char part[1040];
+-            int in = open(source, O_RDONLY), out;
+-            static char buffer[1 << 20];
+-            ssize_t got = 0;
+-
+-            if (in < 0) continue;
+-            snprintf(part, sizeof(part), "%s.part", target);
+-            out = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+-            if (out < 0) { close(in); continue; }
+-            while ((got = read(in, buffer, sizeof(buffer))) > 0)
+-                if (write(out, buffer, (size_t)got) != got) { got = -1; break; }
+-            close(in);
+-            if (close(out) || got < 0 || rename(part, target)) { unlink(part); continue; }
+-            copied++;
+-        }
++        if (copy_file(source, target) == 0) copied++;
+     }
+     closedir(dir);
+     return copied;
+ }
+ 
++/* Make the folders above path. */
++static void make_parents(char *path)
++{
++    for (char *slash = strchr(path + 1, '/'); slash; slash = strchr(slash + 1, '/')) {
++        *slash = 0;
++        mkdir(path, 0777);
++        *slash = '/';
++    }
++}
++
++/* Wine's placeholder files (a prefix's system32 is mostly copies of Wine's
++ * own PE modules, which only say "load the builtin") are not shipped: the
++ * title's placeholders.txt lists them, one "<path in the data folder>\t<
++ * runtime folder>" per line, and each missing one is copied from that
++ * folder of the runtime, under its own name. Returns the number made. */
++static long make_placeholders(const char *runtime, const char *root)
++{
++    char list[256], line[1024];
++    FILE *file;
++    long made = 0;
++
++    snprintf(list, sizeof(list), "%s/placeholders.txt", runtime);
++    if (!(file = fopen(list, "r"))) return -1;
++    while (fgets(line, sizeof(line), file)) {
++        char *tab = strchr(line, '\t'), *end, *name, source[1024], target[1024];
++
++        if (!tab || line[0] == '#') continue;
++        *tab++ = 0;
++        for (end = tab; *end && *end != '\n' && *end != '\r'; end++) {}
++        *end = 0;
++        name = strrchr(line, '/');
++        name = name ? name + 1 : line;
++        if (strstr(line, "..") || strstr(tab, "..") ||
++            snprintf(target, sizeof(target), "%s/%s", root, line) >= (int)sizeof(target) ||
++            snprintf(source, sizeof(source), "%s/win/wine/lib/wine/%s/%s", runtime, tab, name) >=
++                (int)sizeof(source) ||
++            !access(target, F_OK))
++            continue;
++        make_parents(target);
++        if (copy_file(source, target) == 0) made++;
++    }
++    fclose(file);
++    return made;
++}
++
+ /* The first start, or one after a game file was deleted: put the bundled
+  * library in place. Only missing files are copied, so settings, saves and
+  * an updated exe stay. */
+@@ -731,14 +780,16 @@ static void install_bundle(const char *root)
+     for (size_t i = 0; i < sizeof(runtime_roots) / sizeof(runtime_roots[0]); i++) {
+         char bundle[256];
+         uint64_t began = now_ns();
+-        long copied;
++        long copied, made;
+ 
+         snprintf(bundle, sizeof(bundle), "%s/bundle", runtime_roots[i]);
+         mkdir(root, 0777);
+         copied = copy_missing(bundle, root, 0);
+-        PS5LOG_LOG("PW_WINE64 bundle from=%s copied=%ld ms=%llu", bundle, copied,
+-                   (unsigned long long)((now_ns() - began) / 1000000u));
+-        if (copied >= 0) return;
++        if (copied < 0) continue;
++        made = make_placeholders(runtime_roots[i], root);
++        PS5LOG_LOG("PW_WINE64 bundle from=%s copied=%ld placeholders=%ld ms=%llu", bundle, copied,
++                   made, (unsigned long long)((now_ns() - began) / 1000000u));
++        return;
+     }
+ }
+ #endif
+-- 
+2.43.0
+
+
+From dd24497828a7db53a2f1182ece856b36d6d04663 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 15:00:17 -0400
+Subject: [PATCH 3/3] Installation 08 app: close through the system instead of
+ exit()
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_017heTRKLYxAFfzQ4NtBUsib
+---
+ native/wine64_main.c | 48 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/native/wine64_main.c b/native/wine64_main.c
+index 2134bca..887749b 100644
+--- a/native/wine64_main.c
++++ b/native/wine64_main.c
+@@ -650,6 +650,51 @@ static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reas
+ 
+ /* Wine ends the process with exit() when its last program ends: go back to
+  * the launcher. */
++#ifdef PW_FIXED_PROFILE
++/* Closing the title from the game. Ending the process with exit() shows the
++ * console's CE-108255-1 "an error has occurred" (seen on the console), so the
++ * title asks the system to close it instead. Which request works is being
++ * found out: <root>/exit_method holds the digits to try in order (default
++ * 123), each logged first:
++ *   1  sceSystemServiceLoadExec("exit")
++ *   2  sceSystemServiceKillApp on the running app's id
++ *   3  sceLncUtilKillApp on it
++ *   4  _exit(0) at once (what happened before, without the exit handlers) */
++int sceSystemServiceGetAppIdOfRunningBigApp(void);
++int sceSystemServiceKillApp(int app_id, int how, int reason, int core_dump);
++int sceLncUtilKillApp(int app_id);
++
++static void close_to_home(void)
++{
++    char path[PW_WINE_LIBRARY_PATH + 16], order[16] = "123";
++    FILE *file;
++
++    snprintf(path, sizeof(path), "%s/exit_method", library_root);
++    if ((file = fopen(path, "r"))) {
++        if (!fgets(order, sizeof(order), file)) snprintf(order, sizeof(order), "123");
++        fclose(file);
++    }
++    for (const char *step = order; *step >= '1' && *step <= '9'; step++) {
++        int rc = 0, app = sceSystemServiceGetAppIdOfRunningBigApp();
++
++        PS5LOG_LOG("PW_WINE64 close method=%c app=0x%x", *step, (unsigned)app);
++        pw_diagnostics_close("wine64-close");
++        switch (*step) {
++        case '1': rc = sceSystemServiceLoadExec("exit", NULL); break;
++        case '2': rc = sceSystemServiceKillApp(app, -1, 0, 0); break;
++        case '3': rc = sceLncUtilKillApp(app); break;
++        case '4': _exit(0);
++        default: continue;
++        }
++        /* A kill takes a moment to arrive. */
++        sleep(3);
++        pw_diagnostics_resume();
++        PS5LOG_LOG("PW_WINE64 close method=%c returned rc=0x%08x", *step, (unsigned)rc);
++    }
++    pw_diagnostics_close("wine64-exit");
++}
++#endif
++
+ static char game_prefix[PW_WINE_LIBRARY_PATH + PW_APP_ID_CAPACITY];
+ 
+ static void on_exit_report(void)
+@@ -666,8 +711,7 @@ static void on_exit_report(void)
+         }
+     }
+ #endif
+-    /* Back to Home. */
+-    pw_diagnostics_close("wine64-exit");
++    close_to_home();
+     return;
+ #endif
+     restart_title(NULL, launch.cycle + 1u, "wine-exit");
+-- 
+2.43.0
+
